@@ -4,7 +4,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
 import { apiRequest } from './api';
-import { collectionWriteRoles, ledgerViewRoles } from './roles';
+import { auditRoles, collectionWriteRoles, ledgerViewRoles } from './roles';
 import Workspace from './Workspace';
 import './App.css';
 
@@ -39,6 +39,7 @@ const navigation = [
   { path: '/receivables', label: 'Receivables' },
   { path: '/receipts', label: 'Receipts' },
   { path: '/reports', label: 'Reports', roles: ledgerViewRoles },
+  { path: '/audit-logs', label: 'Audit logs', roles: auditRoles },
 ];
 
 function canOpen(path: string, role: string): boolean {
@@ -222,6 +223,7 @@ function AppShell({
           <Route path="/receivables" element={<ProtectedRoute auth={auth}><Workspace page="receivables" auth={auth} /></ProtectedRoute>} />
           <Route path="/receipts" element={<ProtectedRoute auth={auth}><Workspace page="receipts" auth={auth} /></ProtectedRoute>} />
           <Route path="/reports" element={<ProtectedRoute auth={auth} allowedRoles={ledgerViewRoles}><Workspace page="reports" auth={auth} /></ProtectedRoute>} />
+          <Route path="/audit-logs" element={<ProtectedRoute auth={auth} allowedRoles={auditRoles}><Workspace page="audit-logs" auth={auth} /></ProtectedRoute>} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>

@@ -3,10 +3,12 @@ import {
   useForm,
   type Path,
 } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { getCoreRowModel, useLegacyTable } from '@tanstack/react-table/legacy';
 import { apiRequest, type ApiResponse } from './api';
 import {
+  auditRoles,
   billingRoles,
   collectionWriteRoles,
   managerRoles,
@@ -31,7 +33,8 @@ type Page =
   | 'collections'
   | 'receivables'
   | 'receipts'
-  | 'reports';
+  | 'reports'
+  | 'audit-logs';
 type FormSchema = z.ZodObject<z.ZodRawShape>;
 type FormInput<S extends FormSchema> = z.input<S>;
 type FormField<S extends FormSchema> = {
@@ -1275,9 +1278,26 @@ function Receivables({ auth }: { auth: Auth }) {
 }
 
 function Receipts({ auth }: { auth: Auth }) {
-  const receipts = useResource<Row>('/api/v1/receipts', auth.token);
+  const [filters, setFilters] = useState({ status: '', startDate: '', endDate: '' });
+  const [search, setSearch] = useState('');
+  const query = new URLSearchParams();
+  if (filters.status) query.set('status', filters.status);
+  if (filters.startDate) query.set('startDate', `${filters.startDate}T00:00:00.000Z`);
+  if (filters.endDate) query.set('endDate', `${filters.endDate}T23:59:59.999Z`);
+  const receipts = useResource<Row>(`/api/v1/receipts${query.size ? `?${query.toString()}` : ''}`, auth.token);
   const payments = useResource<Row>('/api/v1/payments', auth.token);
   const canWrite = paymentRoles.includes(auth.user.role);
+  const visibleReceipts = receipts.data.filter((receipt) => {
+    const term = search.trim().toLowerCase();
+    return !term || [
+      receipt.receiptNumber,
+      receipt.paymentNumber,
+      receipt.subscriberAccountNumber,
+      receipt.subscriberFirstName,
+      receipt.subscriberLastName,
+      receipt.paymentReferenceNumber,
+    ].some((value) => String(value ?? '').toLowerCase().includes(term));
+  });
   return (
     <div className="page-content">
       <SectionTitle title="Receipts" detail="Issue receipt records for posted payments and review receipt history." />
@@ -1292,36 +1312,371 @@ function Receipts({ auth }: { auth: Auth }) {
           await receipts.refresh();
         }} />
       </Panel>}
-      <Panel title="Receipt register" description={`${receipts.data.length} receipt records`}>
+      <Panel title="Receipt register" description={`${visibleReceipts.length} matching receipt records`}>
+        <div className="report-filters">
+          <label className="field">Search receipts
+            <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Receipt, payment, account, name or reference" />
+          </label>
+          <label className="field">Status
+            <select value={filters.status} onChange={(event) => setFilters((current) => ({ ...current, status: event.target.value }))}>
+              <option value="">All statuses</option><option value="ACTIVE">Active</option><option value="VOID">Void</option>
+            </select>
+          </label>
+          <label className="field">Issued from
+            <input type="date" value={filters.startDate} onChange={(event) => setFilters((current) => ({ ...current, startDate: event.target.value }))} />
+          </label>
+          <label className="field">Issued through
+            <input type="date" value={filters.endDate} onChange={(event) => setFilters((current) => ({ ...current, endDate: event.target.value }))} />
+          </label>
+          <button className="button button-quiet" onClick={() => { setFilters({ status: '', startDate: '', endDate: '' }); setSearch(''); }}>Clear filters</button>
+        </div>
         <LoadState loading={receipts.loading} error={receipts.error} refresh={() => void receipts.refresh()}>
-          <DataTable rows={receipts.data} fields={['receiptNumber', 'paymentNumber', 'subscriberAccountNumber', 'paymentDate', 'paymentAmount', 'paymentMethod', 'status']} labels={{ receiptNumber: 'Receipt no.', paymentNumber: 'Payment', subscriberAccountNumber: 'Subscriber', paymentDate: 'Date', paymentAmount: 'Amount', paymentMethod: 'Method' }} />
+          <DataTable rows={visibleReceipts} fields={['receiptNumber', 'paymentNumber', 'subscriberAccountNumber', 'subscriberFirstName', 'subscriberLastName', 'issuedAt', 'paymentAmount', 'paymentMethod', 'paymentReferenceNumber', 'status']} labels={{ receiptNumber: 'Receipt no.', paymentNumber: 'Payment', subscriberAccountNumber: 'Subscriber', subscriberFirstName: 'First name', subscriberLastName: 'Last name', issuedAt: 'Issued', paymentAmount: 'Amount', paymentMethod: 'Method', paymentReferenceNumber: 'Reference' }} />
         </LoadState>
       </Panel>
     </div>
   );
 }
 
+type ExportColumn = { key: string; label: string };
+
+function downloadBlob(filename: string, blob: Blob) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function exportRowsToExcel(filename: string, columns: ExportColumn[], rows: Row[]) {
+  const { default: ExcelJS } = await import('exceljs');
+  const workbook = new ExcelJS.Workbook();
+  const worksheet = workbook.addWorksheet('Report');
+  worksheet.columns = columns.map(({ key, label }) => ({ key, header: label, width: Math.max(label.length + 2, 14) }));
+  for (const row of rows) {
+    worksheet.addRow(Object.fromEntries(columns.map(({ key }) => {
+      const value = row[key];
+      const text = value === null || value === undefined
+        ? ''
+        : typeof value === 'object'
+          ? JSON.stringify(value)
+          : String(value);
+      return [key, /^[=+\-@]/.test(text) ? `'${text}` : text];
+    })));
+  }
+  const bytes = await workbook.xlsx.writeBuffer();
+  downloadBlob(filename, new Blob([bytes], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  }));
+}
+
+async function exportRowsToPdf(title: string, filename: string, columns: ExportColumn[], rows: Row[]) {
+  const [{ jsPDF }, { default: autoTable }] = await Promise.all([
+    import('jspdf'),
+    import('jspdf-autotable'),
+  ]);
+  const document = new jsPDF({ orientation: columns.length > 6 ? 'landscape' : 'portrait' });
+  document.text(title, 14, 16);
+  autoTable(document, {
+    startY: 23,
+    head: [columns.map((column) => column.label)],
+    body: rows.map((row) => columns.map(({ key }) => rowString(row[key]))),
+    styles: { fontSize: 7, cellPadding: 2 },
+    headStyles: { fillColor: [18, 107, 91] },
+  });
+  document.save(filename);
+}
+
+const auditFilterSchema = z.object({
+  userId: z.string().regex(/^(?:[1-9]\d*)?$/, 'User ID must be a positive number.'),
+  action: z.string(),
+  entityType: z.string(),
+  entityId: z.string().regex(/^(?:[1-9]\d*)?$/, 'Entity ID must be a positive number.'),
+  startDate: z.string(),
+  endDate: z.string(),
+}).refine((values) => !values.startDate || !values.endDate || values.startDate <= values.endDate, {
+  message: 'Start date must be on or before end date.',
+  path: ['endDate'],
+});
+
+function AuditLogs({ auth }: { auth: Auth }) {
+  const [path, setPath] = useState('/api/v1/audit-logs');
+  const [selected, setSelected] = useState<Row | null>(null);
+  const [filters, setFilters] = useState({ userId: '', action: '', entityType: '', entityId: '', startDate: '', endDate: '' });
+  const auditData = useResource<Row>(path, auth.token);
+  const form = useForm<z.input<typeof auditFilterSchema>>({
+    resolver: zodResolver(auditFilterSchema),
+    defaultValues: filters,
+  });
+  const canView = auditRoles.includes(auth.user.role);
+
+  const applyFilters = form.handleSubmit((values) => {
+    const query = new URLSearchParams();
+    if (values.userId) query.set('userId', values.userId);
+    if (values.action.trim()) query.set('action', values.action.trim());
+    if (values.entityType.trim()) query.set('entityType', values.entityType.trim());
+    if (values.entityId) query.set('entityId', values.entityId);
+    if (values.startDate) query.set('startDate', `${values.startDate}T00:00:00.000Z`);
+    if (values.endDate) query.set('endDate', `${values.endDate}T23:59:59.999Z`);
+    setFilters(values);
+    setPath(`/api/v1/audit-logs${query.size ? `?${query.toString()}` : ''}`);
+    setSelected(null);
+  });
+
+  if (!canView) return <div className="notice error" role="alert">Your role is not permitted to view audit information.</div>;
+
+  return (
+    <div className="page-content">
+      <SectionTitle title="Audit log" detail="Read-only, sanitized audit history. Sensitive values are redacted by the API." />
+      <Panel title="Filter audit events" description="Combine user, action, entity and date filters.">
+        <form className="report-filters" onSubmit={applyFilters}>
+          <label className="field">User ID<input inputMode="numeric" {...form.register('userId')} /></label>
+          <label className="field">Action<input placeholder="e.g. CREATE, REVERSE" {...form.register('action')} /></label>
+          <label className="field">Entity type<input placeholder="e.g. payments" {...form.register('entityType')} /></label>
+          <label className="field">Entity ID<input inputMode="numeric" {...form.register('entityId')} /></label>
+          <label className="field">From<input type="date" {...form.register('startDate')} /></label>
+          <label className="field">Through<input type="date" {...form.register('endDate')} /></label>
+          <div className="report-filter-actions">
+            <button className="primary-button">Apply filters</button>
+            <button type="button" className="button button-quiet" onClick={() => {
+              const blank = { userId: '', action: '', entityType: '', entityId: '', startDate: '', endDate: '' };
+              form.reset(blank);
+              setFilters(blank);
+              setPath('/api/v1/audit-logs');
+              setSelected(null);
+            }}>Clear</button>
+          </div>
+          {Object.values(form.formState.errors).map((error, index) => (
+            <small className="field-error" key={`${error.message}-${index}`}>{error.message}</small>
+          ))}
+        </form>
+      </Panel>
+      <Panel title="Audit events" description={`${auditData.data.length} events returned by the audit API`}>
+        <LoadState loading={auditData.loading} error={auditData.error} refresh={() => void auditData.refresh()}>
+          <DataTable rows={auditData.data} fields={['createdAt', 'userFullName', 'username', 'action', 'entityType', 'entityId', 'reason']} labels={{ createdAt: 'Date and time', userFullName: 'User', username: 'Username', entityType: 'Entity', entityId: 'Record ID' }} actions={(row) => <button className="text-button" onClick={() => setSelected(row)}>Details</button>} />
+        </LoadState>
+      </Panel>
+      {selected && <Panel title={`Audit event ${String(selected.id)}`} description={`${String(selected.action)} · ${String(selected.entityType)} ${String(selected.entityId ?? '')}`}>
+        <div className="audit-detail-grid">
+          <div><h3>Reason</h3><p>{rowString(selected.reason)}</p></div>
+          <div><h3>Old values</h3><pre>{JSON.stringify(selected.oldValues ?? null, null, 2)}</pre></div>
+          <div><h3>New values</h3><pre>{JSON.stringify(selected.newValues ?? null, null, 2)}</pre></div>
+        </div>
+        <button className="button button-quiet" onClick={() => setSelected(null)}>Close details</button>
+      </Panel>}
+    </div>
+  );
+}
+
+type ReportKind = 'invoices' | 'payments' | 'collections' | 'receivables' | 'suspensions' | 'reconnections' | 'ledger';
+
 function Reports({ auth }: { auth: Auth }) {
+  const [kind, setKind] = useState<ReportKind>('invoices');
+  const [filters, setFilters] = useState({ startDate: '', endDate: '', status: '' });
+  const [search, setSearch] = useState('');
+  const [exportError, setExportError] = useState('');
+  const invoices = useResource<Row>('/api/v1/invoices', auth.token);
   const ledger = useResource<Row>('/api/v1/ledger', auth.token);
   const receivables = useResource<Row>('/api/v1/receivables', auth.token);
   const payments = useResource<Row>('/api/v1/payments', auth.token);
-  const loading = ledger.loading || receivables.loading || payments.loading;
-  const error = ledger.error || receivables.error || payments.error;
-  const refresh = () => { void Promise.all([ledger.refresh(), receivables.refresh(), payments.refresh()]); };
-  const posted = payments.data.filter((payment) => payment.status === 'POSTED');
-  const totalPayments = posted.reduce((sum, payment) => sum + cents(payment.amount), 0n);
-  const totalReceivables = receivables.data.reduce((sum, account) => sum + cents(account.outstandingBalance), 0n);
+  const batches = useResource<Row>('/api/v1/collection-batches', auth.token);
+  const remittances = useResource<Row>('/api/v1/collector-remittances', auth.token);
+  const suspensions = useResource<Row>('/api/v1/suspensions', auth.token);
+  const reconnections = useResource<Row>('/api/v1/reconnections', auth.token);
+  const sources = [invoices, payments, batches, remittances, receivables, suspensions, reconnections, ledger];
+  const loading = sources.some((source) => source.loading);
+  const error = sources.find((source) => source.error)?.error ?? '';
+  const refresh = () => { void Promise.all(sources.map((source) => source.refresh())); };
+  const receivableInvoices = receivables.data.flatMap((account) => (
+    Array.isArray(account.invoices)
+      ? (account.invoices as Row[]).map((invoice) => ({
+        ...invoice,
+        serviceAccountNumber: account.serviceAccountNumber,
+        subscriberAccountNumber: account.subscriberAccountNumber,
+        agingBucket: invoice.agingBucket,
+      }))
+      : []
+  ));
+  const reportData: Record<ReportKind, Row[]> = {
+    invoices: invoices.data,
+    payments: payments.data,
+    collections: remittances.data,
+    receivables: receivableInvoices,
+    suspensions: suspensions.data,
+    reconnections: reconnections.data,
+    ledger: ledger.data,
+  };
+  const dateField: Record<ReportKind, string> = {
+    invoices: 'invoiceDate',
+    payments: 'paymentDate',
+    collections: 'remittanceDate',
+    receivables: 'dueDate',
+    suspensions: 'suspensionDate',
+    reconnections: 'requestDate',
+    ledger: 'entryDate',
+  };
+  const statusOptions: Record<ReportKind, string[]> = {
+    invoices: ['DRAFT', 'UNPAID', 'PARTIALLY_PAID', 'OVERDUE', 'PAID'],
+    payments: ['PENDING', 'POSTED', 'REVERSED'],
+    collections: ['OPEN', 'IN_PROGRESS', 'REMITTED', 'PENDING', 'RECONCILED', 'CLOSED'],
+    receivables: ['CURRENT', '1_30_DAYS', '31_60_DAYS', '61_90_DAYS', 'OVER_90_DAYS'],
+    suspensions: ['ACTIVE', 'RECONNECTED', 'CANCELLED'],
+    reconnections: ['REQUESTED', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED'],
+    ledger: [],
+  };
+  const filteredRows = reportData[kind].filter((row) => {
+    const date = String(row[dateField[kind]] ?? '').slice(0, 10);
+    const inRange = (!filters.startDate || date >= filters.startDate)
+      && (!filters.endDate || date <= filters.endDate);
+    const status = kind === 'receivables' ? row.agingBucket : row.status;
+    const statusMatches = !filters.status || String(status) === filters.status;
+    const term = search.trim().toLowerCase();
+    const searchMatches = !term || Object.values(row).some((value) => (
+      value !== null && typeof value !== 'object' && String(value).toLowerCase().includes(term)
+    ));
+    return inRange && statusMatches && searchMatches;
+  });
+  const reportColumns: Record<ReportKind, ExportColumn[]> = {
+    invoices: [
+      { key: 'invoiceNumber', label: 'Invoice' }, { key: 'subscriberAccountNumber', label: 'Subscriber' },
+      { key: 'serviceAccountNumber', label: 'Service' }, { key: 'invoiceDate', label: 'Invoice date' },
+      { key: 'dueDate', label: 'Due date' }, { key: 'totalAmount', label: 'Total' },
+      { key: 'amountPaid', label: 'Paid' }, { key: 'balance', label: 'Balance' }, { key: 'status', label: 'Status' },
+    ],
+    payments: [
+      { key: 'paymentNumber', label: 'Payment' }, { key: 'subscriberAccountNumber', label: 'Subscriber' },
+      { key: 'paymentDate', label: 'Date' }, { key: 'amount', label: 'Amount' },
+      { key: 'paymentMethod', label: 'Method' }, { key: 'referenceNumber', label: 'Reference' }, { key: 'status', label: 'Status' },
+    ],
+    collections: [
+      { key: 'batchNumber', label: 'Batch' }, { key: 'collectorName', label: 'Collector' },
+      { key: 'areaName', label: 'Area' }, { key: 'remittanceDate', label: 'Remittance date' },
+      { key: 'expectedCash', label: 'Expected cash' }, { key: 'remittedCash', label: 'Remitted cash' },
+      { key: 'difference', label: 'Variance' }, { key: 'status', label: 'Status' },
+    ],
+    receivables: [
+      { key: 'invoiceNumber', label: 'Invoice' }, { key: 'subscriberAccountNumber', label: 'Subscriber' },
+      { key: 'serviceAccountNumber', label: 'Service' }, { key: 'dueDate', label: 'Due date' },
+      { key: 'totalAmount', label: 'Total' }, { key: 'amountPaid', label: 'Paid' },
+      { key: 'balance', label: 'Outstanding' }, { key: 'daysOverdue', label: 'Days overdue' },
+      { key: 'agingBucket', label: 'Aging bucket' },
+    ],
+    suspensions: [
+      { key: 'subscriberAccountNumber', label: 'Subscriber' }, { key: 'serviceAccountNumber', label: 'Service' },
+      { key: 'suspensionDate', label: 'Suspension date' }, { key: 'reason', label: 'Reason' },
+      { key: 'approvedByName', label: 'Recorded by' }, { key: 'status', label: 'Status' },
+    ],
+    reconnections: [
+      { key: 'subscriberAccountNumber', label: 'Subscriber' }, { key: 'serviceAccountNumber', label: 'Service' },
+      { key: 'requestDate', label: 'Request date' }, { key: 'completionDate', label: 'Completion date' },
+      { key: 'reconnectionFee', label: 'Fee' }, { key: 'status', label: 'Status' },
+    ],
+    ledger: [
+      { key: 'entryDate', label: 'Date' }, { key: 'entryType', label: 'Entry' },
+      { key: 'serviceAccountNumber', label: 'Service' }, { key: 'invoiceNumber', label: 'Invoice' },
+      { key: 'paymentNumber', label: 'Payment' }, { key: 'debit', label: 'Debit' },
+      { key: 'credit', label: 'Credit' }, { key: 'referenceNumber', label: 'Reference' },
+    ],
+  };
+  const title: Record<ReportKind, string> = {
+    invoices: 'Invoice report',
+    payments: 'Payment report',
+    collections: 'Collection and remittance report',
+    receivables: 'Receivables and aging report',
+    suspensions: 'Suspension report',
+    reconnections: 'Reconnection report',
+    ledger: 'Ledger report',
+  };
+  const amountTotals: Record<ReportKind, Array<{ key: string; label: string }>> = {
+    invoices: [{ key: 'totalAmount', label: 'Invoiced' }, { key: 'amountPaid', label: 'Allocated' }, { key: 'balance', label: 'Balance' }],
+    payments: [{ key: 'amount', label: 'Payments' }],
+    collections: [{ key: 'expectedCash', label: 'Expected cash' }, { key: 'remittedCash', label: 'Remitted cash' }, { key: 'difference', label: 'Variance' }],
+    receivables: [{ key: 'balance', label: 'Outstanding' }],
+    suspensions: [],
+    reconnections: [{ key: 'reconnectionFee', label: 'Reconnection fees' }],
+    ledger: [{ key: 'debit', label: 'Debits' }, { key: 'credit', label: 'Credits' }],
+  };
+
+  const totals = amountTotals[kind].map(({ key, label }) => ({
+    label,
+    value: filteredRows.reduce((sum, row) => sum + cents(row[key]), 0n),
+  }));
+  const filteredBatches = batches.data.filter((row) => {
+    const date = String(row.collectionDate ?? '').slice(0, 10);
+    return (!filters.startDate || date >= filters.startDate)
+      && (!filters.endDate || date <= filters.endDate)
+      && (!filters.status || String(row.status) === filters.status);
+  });
+  const batchColumns: ExportColumn[] = [
+    { key: 'batchNumber', label: 'Batch' }, { key: 'collectionDate', label: 'Collection date' },
+    { key: 'collectorName', label: 'Collector' }, { key: 'areaName', label: 'Area' },
+    { key: 'expectedCash', label: 'Expected cash' }, { key: 'expectedNonCash', label: 'Expected non-cash' },
+    { key: 'status', label: 'Status' },
+  ];
+
   return (
     <div className="page-content">
-      <SectionTitle title="Reports" detail="Live operational summaries from payment, receivable and ledger endpoints." />
-      <LoadState loading={loading} error={error} refresh={refresh}>
-        <div className="metric-grid two">
-          <Metric label="Posted payment volume" value={moneyText(totalPayments)} note={`${posted.length} posted payments`} />
-          <Metric label="Outstanding receivables" value={moneyText(totalReceivables)} note={`${receivables.data.length} service accounts`} />
+      <SectionTitle title="Reports" detail="Filter live billing, payment, collection, receivables, service lifecycle and ledger data; export the current view." />
+      <Panel title="Report filters" description="Financial values are kept as exact decimal strings and summed in integer cents.">
+        <div className="report-filters">
+          <label className="field">Report
+            <select value={kind} onChange={(event) => { setKind(event.target.value as ReportKind); setFilters({ startDate: '', endDate: '', status: '' }); setSearch(''); }}>
+              <option value="invoices">Invoices</option><option value="payments">Payments</option>
+              <option value="collections">Collections & remittances</option><option value="receivables">Receivables & aging</option>
+              <option value="suspensions">Suspensions</option><option value="reconnections">Reconnections</option><option value="ledger">Ledger</option>
+            </select>
+          </label>
+          <label className="field">From<input type="date" value={filters.startDate} onChange={(event) => setFilters((current) => ({ ...current, startDate: event.target.value }))} /></label>
+          <label className="field">Through<input type="date" value={filters.endDate} onChange={(event) => setFilters((current) => ({ ...current, endDate: event.target.value }))} /></label>
+          <label className="field">Status / aging bucket
+            <select value={filters.status} onChange={(event) => setFilters((current) => ({ ...current, status: event.target.value }))}>
+              <option value="">All statuses</option>
+              {statusOptions[kind].map((status) => <option key={status} value={status}>{status.replace(/_/g, ' ')}</option>)}
+            </select>
+          </label>
+          <label className="field">Search report<input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search visible report fields" /></label>
+          <div className="report-filter-actions">
+            <button className="button button-quiet" onClick={() => { setFilters({ startDate: '', endDate: '', status: '' }); setSearch(''); setExportError(''); }}>Clear filters</button>
+            <button className="button" disabled={loading || filteredRows.length === 0} onClick={() => {
+              setExportError('');
+              void exportRowsToExcel(`${kind}-report.xlsx`, reportColumns[kind], filteredRows)
+                .catch((cause: unknown) => setExportError(cause instanceof Error ? cause.message : 'Excel export failed.'));
+            }}>Export Excel</button>
+            <button className="button" disabled={loading || filteredRows.length === 0} onClick={() => {
+              setExportError('');
+              void exportRowsToPdf(title[kind], `${kind}-report.pdf`, reportColumns[kind], filteredRows)
+                .catch((cause: unknown) => setExportError(cause instanceof Error ? cause.message : 'PDF export failed.'));
+            }}>Export PDF</button>
+          </div>
+          {exportError && <div className="notice error field-wide" role="alert">{exportError}</div>}
         </div>
-        <Panel title="Ledger activity" description="Read-only accounting entries.">
-          <DataTable rows={ledger.data} fields={['entryDate', 'entryType', 'serviceAccountNumber', 'invoiceNumber', 'paymentNumber', 'debit', 'credit', 'referenceNumber']} labels={{ entryDate: 'Date', entryType: 'Entry', serviceAccountNumber: 'Service account', invoiceNumber: 'Invoice', paymentNumber: 'Payment', referenceNumber: 'Reference' }} />
+      </Panel>
+      <LoadState loading={loading} error={error} refresh={refresh}>
+        {totals.length > 0 && <div className="metric-grid two">
+          {totals.map((item) => <Metric key={item.label} label={item.label} value={moneyText(item.value)} note={`Exact total across ${filteredRows.length} filtered rows`} />)}
+        </div>}
+        <Panel title={title[kind]} description={`${filteredRows.length} matching rows`}>
+          <DataTable rows={filteredRows} fields={reportColumns[kind].map((column) => column.key)} labels={Object.fromEntries(reportColumns[kind].map((column) => [column.key, column.label]))} />
         </Panel>
+        {kind === 'collections' && <Panel title="Collection batch register" description={`${filteredBatches.length} matching collection batches`}>
+          <div className="report-filter-actions">
+            <button className="button" disabled={loading || filteredBatches.length === 0} onClick={() => {
+              setExportError('');
+              void exportRowsToExcel('collection-batches-report.xlsx', batchColumns, filteredBatches)
+                .catch((cause: unknown) => setExportError(cause instanceof Error ? cause.message : 'Excel export failed.'));
+            }}>Export batches to Excel</button>
+            <button className="button" disabled={loading || filteredBatches.length === 0} onClick={() => {
+              setExportError('');
+              void exportRowsToPdf('Collection batch report', 'collection-batches-report.pdf', batchColumns, filteredBatches)
+                .catch((cause: unknown) => setExportError(cause instanceof Error ? cause.message : 'PDF export failed.'));
+            }}>Export batches to PDF</button>
+          </div>
+          {exportError && <div className="notice error" role="alert">{exportError}</div>}
+          <DataTable rows={filteredBatches} fields={batchColumns.map((column) => column.key)} labels={Object.fromEntries(batchColumns.map((column) => [column.key, column.label]))} />
+        </Panel>}
       </LoadState>
     </div>
   );
@@ -1336,5 +1691,6 @@ export default function Workspace({ page, auth }: { page: Page; auth: Auth }) {
   if (page === 'collections') return <Collections auth={auth} />;
   if (page === 'receivables') return <Receivables auth={auth} />;
   if (page === 'receipts') return <Receipts auth={auth} />;
+  if (page === 'audit-logs') return <AuditLogs auth={auth} />;
   return <Reports auth={auth} />;
 }

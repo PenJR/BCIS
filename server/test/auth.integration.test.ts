@@ -21,6 +21,7 @@ import {
   paymentProofs,
   paymentReversals,
   payments,
+  receipts,
   roles,
   serviceAccounts,
   serviceEvents,
@@ -33,6 +34,7 @@ import {
   users,
 } from '../db/schema';
 import { authRoutes } from '../src/routes/auth';
+import { auditRoutes } from '../src/routes/audit';
 import { billingCycleRoutes } from '../src/routes/billing-cycles';
 import { billingGenerationRoutes } from '../src/routes/billing-generation';
 import { collectionRoutes } from '../src/routes/collections';
@@ -42,6 +44,7 @@ import { ledgerRoutes } from '../src/routes/ledger';
 import { paymentAllocationRoutes } from '../src/routes/payment-allocations';
 import { paymentRoutes } from '../src/routes/payments';
 import { receivableRoutes } from '../src/routes/receivables';
+import { receiptRoutes } from '../src/routes/receipts';
 import { suspensionRoutes } from '../src/routes/suspension';
 import { subscriberRoutes } from '../src/routes/subscribers';
 import { serviceAccountRoutes } from '../src/routes/service-accounts';
@@ -95,6 +98,8 @@ const receivableInvoiceIds: number[] = [];
 const receivablePaymentIds: number[] = [];
 const suspensionRecordIds: number[] = [];
 const reconnectionRecordIds: number[] = [];
+const phase12AuditIds: number[] = [];
+const phase12ReceiptIds: number[] = [];
 let app: Fastify.FastifyInstance | undefined;
 let databaseAvailable = false;
 let ownerRoleId = 0;
@@ -161,6 +166,7 @@ before(async () => {
 
   app = Fastify();
   await app.register(authRoutes);
+  await app.register(auditRoutes);
   await app.register(subscriberRoutes);
   await app.register(serviceAccountRoutes);
   await app.register(serviceEventRoutes);
@@ -174,6 +180,7 @@ before(async () => {
   await app.register(collectionRoutes);
   await app.register(suspensionRoutes);
   await app.register(receivableRoutes);
+  await app.register(receiptRoutes);
   await app.ready();
 });
 
@@ -188,6 +195,9 @@ after(async () => {
 
   if (db && testUserIds.length > 0) {
     const database = db;
+    if (phase12ReceiptIds.length > 0) {
+      await database.delete(receipts).where(inArray(receipts.id, phase12ReceiptIds));
+    }
     if (paymentIds.length > 0) {
       await database.delete(paymentAllocations).where(inArray(paymentAllocations.paymentId, paymentIds));
       await database.delete(ledgerEntries).where(inArray(ledgerEntries.paymentId, paymentIds));
@@ -209,6 +219,9 @@ after(async () => {
     }
     if (reconnectionRecordIds.length > 0) {
       await database.delete(reconnectionRecords).where(inArray(reconnectionRecords.id, reconnectionRecordIds));
+    }
+    if (phase12AuditIds.length > 0) {
+      await database.delete(auditLogs).where(inArray(auditLogs.id, phase12AuditIds));
     }
     if (suspensionRecordIds.length > 0) {
       await database.delete(suspensionRecords).where(inArray(suspensionRecords.id, suspensionRecordIds));
@@ -1756,4 +1769,118 @@ test('receivables aging and suspension lifecycle use outstanding balances', asyn
     ));
   assert.ok(suspensionAudit.some((entry) => entry.action === 'SUSPEND'));
   assert.ok(reconnectionAudit.some((entry) => entry.action === 'RECONNECT'));
+});
+
+test('audit report enforces RBAC, filters logs, and redacts sensitive values', async (context) => {
+  if (!databaseAvailable || !app || !db) {
+    context.skip('PostgreSQL is unavailable for audit integration tests.');
+    return;
+  }
+
+  const token = `phase12-auditor-${randomUUID()}`;
+  const cashierToken = `phase12-cashier-${randomUUID()}`;
+  issuedTokens.push(token, cashierToken);
+  authSessions.set(token, {
+    userId: testUserIds[0],
+    username: usernames[0],
+    fullName: 'Synthetic Test Auditor',
+    role: 'ACCOUNTING_AUDITOR',
+    expiresAt: Date.now() + 60_000,
+  });
+  authSessions.set(cashierToken, {
+    userId: testUserIds[0],
+    username: usernames[0],
+    fullName: 'Synthetic Test Cashier',
+    role: 'CASHIER',
+    expiresAt: Date.now() + 60_000,
+  });
+
+  assert.equal((await app.inject({
+    method: 'GET',
+    url: '/api/v1/audit-logs',
+  })).statusCode, 401);
+  assert.equal((await app.inject({
+    method: 'GET',
+    url: '/api/v1/audit-logs',
+    headers: { authorization: `Bearer ${cashierToken}` },
+  })).statusCode, 403);
+
+  const suffix = randomUUID().slice(0, 8);
+  const action = `PHASE12_REPORT_${suffix}`;
+  const entityType = `phase12_report_${suffix}`;
+  const [created] = await db.insert(auditLogs).values({
+    userId: testUserIds[0],
+    action,
+    entityType,
+    entityId: 900001,
+    reason: 'Synthetic report filter fixture.',
+    oldValues: JSON.stringify({ status: 'OLD', password: 'not-for-display' }),
+    newValues: JSON.stringify({ status: 'NEW', accessToken: 'not-for-display' }),
+    ipAddress: '127.0.0.1',
+    createdAt: new Date(),
+  }).returning({ id: auditLogs.id, createdAt: auditLogs.createdAt });
+  phase12AuditIds.push(created.id);
+
+  const params = new URLSearchParams({
+    userId: String(testUserIds[0]),
+    action: suffix,
+    entityType,
+    entityId: '900001',
+    startDate: new Date(Date.now() - 60_000).toISOString(),
+    endDate: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const filtered = await app.inject({
+    method: 'GET',
+    url: `/api/v1/audit-logs?${params.toString()}`,
+    headers: { authorization: `Bearer ${token}` },
+  });
+  assert.equal(filtered.statusCode, 200, filtered.body);
+  assert.equal(filtered.json().data.length, 1);
+  assert.equal(filtered.json().data[0].id, created.id);
+  assert.equal(filtered.json().data[0].oldValues.password, '[REDACTED]');
+  assert.equal(filtered.json().data[0].newValues.accessToken, '[REDACTED]');
+  assert.equal(filtered.json().data[0].newValues.status, 'NEW');
+
+  const detail = await app.inject({
+    method: 'GET',
+    url: `/api/v1/audit-logs/${created.id}`,
+    headers: { authorization: `Bearer ${token}` },
+  });
+  assert.equal(detail.statusCode, 200, detail.body);
+  assert.equal(detail.json().data.oldValues.password, '[REDACTED]');
+
+  const invalidRange = await app.inject({
+    method: 'GET',
+    url: '/api/v1/audit-logs?startDate=2026-10-06T23%3A00%3A00.000Z&endDate=2026-10-06T22%3A00%3A00.000Z',
+    headers: { authorization: `Bearer ${token}` },
+  });
+  assert.equal(invalidRange.statusCode, 400);
+
+  const [postedPayment] = await db.select({ id: payments.id })
+    .from(payments)
+    .where(and(
+      inArray(payments.id, paymentIds),
+      eq(payments.status, 'POSTED'),
+    ))
+    .limit(1);
+  assert.ok(postedPayment, 'A posted payment is required for receipt report coverage.');
+  const [receipt] = await db.insert(receipts).values({
+    receiptNumber: `RCT-PHASE12-${suffix}`,
+    paymentId: postedPayment.id,
+    status: 'ACTIVE',
+    issuedAt: new Date(),
+  }).returning({ id: receipts.id });
+  phase12ReceiptIds.push(receipt.id);
+
+  assert.equal((await app.inject({
+    method: 'GET',
+    url: '/api/v1/receipts',
+  })).statusCode, 401);
+  const receiptReport = await app.inject({
+    method: 'GET',
+    url: `/api/v1/receipts?status=ACTIVE&startDate=${encodeURIComponent(new Date(Date.now() - 60_000).toISOString())}&endDate=${encodeURIComponent(new Date(Date.now() + 60_000).toISOString())}`,
+    headers: { authorization: `Bearer ${token}` },
+  });
+  assert.equal(receiptReport.statusCode, 200, receiptReport.body);
+  assert.ok(receiptReport.json().data.some((item: Record<string, unknown>) => item.id === receipt.id));
 });

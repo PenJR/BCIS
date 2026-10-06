@@ -631,6 +631,51 @@ tbody tr:hover td {
   overflow-wrap: anywhere;
 }
 
+.report-filters {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: end;
+  gap: 13px;
+}
+
+.report-filter-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+
+.audit-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 13px;
+  margin-bottom: 14px;
+}
+
+.audit-detail-grid > div {
+  min-width: 0;
+  padding: 13px;
+  background: #f7f9f9;
+  border: 1px solid #e4eaea;
+  border-radius: 8px;
+}
+
+.audit-detail-grid h3 {
+  margin-bottom: 9px;
+  color: #34464d;
+  font-size: 0.82rem;
+}
+
+.audit-detail-grid pre {
+  max-height: 320px;
+  overflow: auto;
+  margin: 0;
+  color: #31454b;
+  font-size: 0.72rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 1080px) {
   .app-shell {
     grid-template-columns: 220px minmax(0, 1fr);
@@ -671,6 +716,8 @@ tbody tr:hover td {
   .dashboard-grid,
   .form-grid,
   .detail-grid,
+  .report-filters,
+  .audit-detail-grid,
   .metric-grid.two {
     grid-template-columns: 1fr;
   }
