@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID, pbkdf2Sync } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import Fastify from 'fastify';
 import { after, before, test } from 'node:test';
 import { and, eq, inArray } from 'drizzle-orm';
@@ -49,6 +51,7 @@ import { suspensionRoutes } from '../src/routes/suspension';
 import { subscriberRoutes } from '../src/routes/subscribers';
 import { serviceAccountRoutes } from '../src/routes/service-accounts';
 import { serviceEventRoutes } from '../src/routes/service-events';
+import { seedDemoData } from '../src/seed-demo';
 import {
   authSessions,
   ensureDemoAdmin,
@@ -710,15 +713,24 @@ test('billing generation is idempotent, exact, ledgered, and transactional', asy
   });
   assert.equal(unauthorizedGeneration.statusCode, 403);
 
-  const generation = await app.inject({
+  const concurrentGenerations = await Promise.all([1, 2].map(() => app!.inject({
     method: 'POST',
     url: '/api/v1/billing/generate',
     headers: authHeaders,
     payload: { billingCycleId: cycleId },
-  });
-  assert.equal(generation.statusCode, 200);
-  assert.equal(generation.json().data.created, activeAccounts.length);
-  assert.equal(generation.json().data.skipped, 0);
+  })));
+  assert.ok(concurrentGenerations.every((response) => response.statusCode === 200));
+  assert.equal(concurrentGenerations.reduce(
+    (total, response) => total + response.json().data.created,
+    0,
+  ), activeAccounts.length);
+  assert.equal(concurrentGenerations.reduce(
+    (total, response) => total + response.json().data.skipped,
+    0,
+  ), activeAccounts.length);
+  const generatedRows = await database.select({ id: invoices.id })
+    .from(invoices).where(eq(invoices.billingCycleId, cycleId));
+  assert.equal(generatedRows.length, activeAccounts.length);
 
   const [generatedInvoice] = await database.select().from(invoices).where(and(
     eq(invoices.billingCycleId, cycleId),
@@ -1132,6 +1144,51 @@ test('payment workflow preserves exact balances, allocation order, audit, and le
     .from(paymentAllocations).where(eq(paymentAllocations.paymentId, overpaymentId));
   assert.equal(rejectedAllocations.length, 0);
 
+  const concurrentCycle = await database.insert(billingCycles).values({
+    cycleCode: `P8-CONCURRENT-${suffix}`,
+    periodStart: '2025-05-01',
+    periodEnd: '2025-05-31',
+    dueDate: '2025-06-15',
+    status: 'CLOSED',
+  }).returning({ id: billingCycles.id });
+  paymentCycleIds.push(concurrentCycle[0].id);
+  const concurrentInvoice = await database.insert(invoices).values({
+    invoiceNumber: `P8-CONCURRENT-${suffix}`,
+    serviceAccountId: masterDataIds.serviceAccountId,
+    billingCycleId: concurrentCycle[0].id,
+    invoiceDate: '2025-05-01',
+    dueDate: '2025-06-15',
+    subtotal: '20.00',
+    discountAmount: '0.00',
+    penaltyAmount: '0.00',
+    totalAmount: '20.00',
+    status: 'UNPAID',
+  }).returning({ id: invoices.id });
+  paymentInvoiceIds.push(concurrentInvoice[0].id);
+  const [racePaymentA, racePaymentB] = await Promise.all([
+    createPayment('15.00'),
+    createPayment('15.00'),
+  ]);
+  const raceResults = await Promise.all([racePaymentA, racePaymentB].map((paymentId) => app!.inject({
+    method: 'POST',
+    url: `/api/v1/payments/${paymentId}/allocations`,
+    headers: authHeaders,
+    payload: { invoiceId: concurrentInvoice[0].id, amount: '15.00' },
+  })));
+  assert.deepEqual(raceResults.map((response) => response.statusCode).sort(), [201, 409]);
+  const concurrentRead = await app.inject({
+    method: 'GET',
+    url: `/api/v1/invoices/${concurrentInvoice[0].id}`,
+    headers: authHeaders,
+  });
+  assert.equal(concurrentRead.statusCode, 200);
+  assert.equal(concurrentRead.json().data.amountPaid, '15.00');
+  assert.equal(concurrentRead.json().data.balance, '5.00');
+  const raceLedger = await database.select().from(ledgerEntries)
+    .where(eq(ledgerEntries.invoiceId, concurrentInvoice[0].id));
+  assert.equal(raceLedger.length, 1);
+  assert.equal(raceLedger[0].credit, '15.00');
+
   const gcashReference = `GC-${suffix}`;
   const gcashPaymentId = await createPayment('12.34', 'GCASH', gcashReference);
   const duplicateGcash = await app.inject({
@@ -1146,6 +1203,44 @@ test('payment workflow preserves exact balances, allocation order, audit, and le
     },
   });
   assert.equal(duplicateGcash.statusCode, 409);
+  const concurrentReference = `GC-RACE-${suffix}`;
+  const cashierToken = `phase14-cashier-${suffix}`;
+  issuedTokens.push(cashierToken);
+  authSessions.set(cashierToken, {
+    userId: testUserIds[0],
+    username: usernames[0],
+    fullName: 'Synthetic Test Cashier',
+    role: 'CASHIER',
+    expiresAt: Date.now() + 60_000,
+  });
+  const referenceRace = await Promise.all([
+    app.inject({
+      method: 'POST',
+      url: '/api/v1/payments',
+      headers: authHeaders,
+      payload: {
+        subscriberId: masterDataIds.subscriberId,
+        amount: '2.50',
+        paymentMethod: 'GCash',
+        referenceNumber: concurrentReference,
+      },
+    }),
+    app.inject({
+      method: 'POST',
+      url: '/api/v1/payments',
+      headers: { authorization: `Bearer ${cashierToken}` },
+      payload: {
+        subscriberId: masterDataIds.subscriberId,
+        amount: '2.50',
+        paymentMethod: 'GCash',
+        referenceNumber: concurrentReference,
+      },
+    }),
+  ]);
+  assert.deepEqual(referenceRace.map((response) => response.statusCode).sort(), [201, 409]);
+  const createdRacePayment = referenceRace.find((response) => response.statusCode === 201);
+  assert.ok(createdRacePayment);
+  paymentIds.push(createdRacePayment.json().data.id as number);
   const proof = await app.inject({
     method: 'POST',
     url: `/api/v1/payments/${gcashPaymentId}/proof`,
@@ -1208,6 +1303,33 @@ test('payment workflow preserves exact balances, allocation order, audit, and le
     .where(eq(ledgerEntries.paymentId, exactPaymentId));
   assert.equal(exactLedger.reduce((sum, entry) => sum + moneyToCents(entry.credit), 0n), 3010n);
   assert.equal(exactLedger.reduce((sum, entry) => sum + moneyToCents(entry.debit), 0n), 3010n);
+  const postedPaymentBeforeDelete = await database.select({
+    amount: payments.amount,
+    status: payments.status,
+  }).from(payments).where(eq(payments.id, exactPaymentId)).limit(1);
+  const paidInvoiceBeforeDelete = await database.select({
+    totalAmount: invoices.totalAmount,
+    status: invoices.status,
+  }).from(invoices).where(eq(invoices.id, fixtureInvoices[0].id)).limit(1);
+  for (const path of [
+    `/api/v1/payments/${exactPaymentId}`,
+    `/api/v1/invoices/${fixtureInvoices[0].id}`,
+  ]) {
+    const deletionAttempt = await app.inject({
+      method: 'DELETE',
+      url: path,
+      headers: authHeaders,
+    });
+    assert.equal(deletionAttempt.statusCode, 404);
+  }
+  assert.deepEqual(await database.select({
+    amount: payments.amount,
+    status: payments.status,
+  }).from(payments).where(eq(payments.id, exactPaymentId)).limit(1), postedPaymentBeforeDelete);
+  assert.deepEqual(await database.select({
+    totalAmount: invoices.totalAmount,
+    status: invoices.status,
+  }).from(invoices).where(eq(invoices.id, fixtureInvoices[0].id)).limit(1), paidInvoiceBeforeDelete);
 
   const rollbackPaymentId = await createPayment('5.00');
   await database.$client.query('DROP TRIGGER IF EXISTS phase8_fail_payment_ledger ON ledger_entries');
@@ -1883,4 +2005,154 @@ test('audit report enforces RBAC, filters logs, and redacts sensitive values', a
   });
   assert.equal(receiptReport.statusCode, 200, receiptReport.body);
   assert.ok(receiptReport.json().data.some((item: Record<string, unknown>) => item.id === receipt.id));
+});
+
+test('demo seed is repeatable and seeded records are available through authenticated APIs', async (context) => {
+  if (!databaseAvailable || !app || !db) {
+    context.skip('PostgreSQL is unavailable for demo seed integration tests.');
+    return;
+  }
+
+  const initialCounts = await seedDemoData();
+  const repeatedCounts = await seedDemoData();
+  assert.deepEqual(repeatedCounts, initialCounts);
+  assert.equal(initialCounts.users, 5);
+  assert.equal(initialCounts.servicePlans, 7);
+  assert.equal(initialCounts.subscribers, 50);
+  assert.equal(initialCounts.serviceAccounts, 60);
+  assert.equal(initialCounts.collectionAreas, 3);
+  assert.equal(initialCounts.billingCycles, 3);
+  assert.ok(initialCounts.invoices >= 180);
+  assert.ok(initialCounts.payments >= 19);
+  assert.ok(initialCounts.collectionBatches >= 2);
+  assert.ok(initialCounts.remittances >= 2);
+  assert.ok(initialCounts.suspensions >= 3);
+  assert.ok(initialCounts.reconnections >= 2);
+
+  const [demoOwner] = await db.select({ id: users.id, passwordHash: users.passwordHash })
+    .from(users)
+    .where(eq(users.username, 'demo13_owner'))
+    .limit(1);
+  assert.ok(demoOwner);
+  assert.notEqual(demoOwner.passwordHash, process.env.BCIS_DEMO_PASSWORD ?? 'Demo13!Only');
+
+  const token = `phase13-demo-${randomUUID()}`;
+  issuedTokens.push(token);
+  authSessions.set(token, {
+    userId: demoOwner.id,
+    username: 'demo13_owner',
+    fullName: 'Demo Owner',
+    role: 'OWNER',
+    expiresAt: Date.now() + 60_000,
+  });
+  const headers = { authorization: `Bearer ${token}` };
+
+  const subscriberResponse = await app.inject({
+    method: 'GET',
+    url: '/api/v1/subscribers?search=DEMO13-SUB-0001',
+    headers,
+  });
+  assert.equal(subscriberResponse.statusCode, 200, subscriberResponse.body);
+  assert.ok(subscriberResponse.json().data.some(
+    (subscriber: Record<string, unknown>) => subscriber.accountNumber === 'DEMO13-SUB-0001',
+  ));
+
+  const invoiceResponse = await app.inject({
+    method: 'GET',
+    url: '/api/v1/invoices',
+    headers,
+  });
+  assert.equal(invoiceResponse.statusCode, 200, invoiceResponse.body);
+  assert.ok(invoiceResponse.json().data.some(
+    (invoice: Record<string, unknown>) => String(invoice.invoiceNumber).startsWith('DEMO13-INV-'),
+  ));
+
+  const receivablesResponse = await app.inject({
+    method: 'GET',
+    url: '/api/v1/receivables',
+    headers,
+  });
+  assert.equal(receivablesResponse.statusCode, 200, receivablesResponse.body);
+  const demoReceivables = receivablesResponse.json().data.filter(
+    (account: Record<string, unknown>) => String(account.serviceAccountNumber).startsWith('DEMO13-SVC-'),
+  );
+  assert.ok(demoReceivables.length >= 10);
+  assert.ok(demoReceivables.filter(
+    (account: Record<string, unknown>) => account.overdueBalance !== '0.00',
+  ).length >= 10);
+
+  const paymentResponse = await app.inject({
+    method: 'GET',
+    url: '/api/v1/payments',
+    headers,
+  });
+  assert.equal(paymentResponse.statusCode, 200, paymentResponse.body);
+  assert.ok(paymentResponse.json().data.some(
+    (payment: Record<string, unknown>) => payment.paymentNumber === 'DEMO13-PAY-REVERSED'
+      && payment.status === 'REVERSED',
+  ));
+
+  const receiptResponse = await app.inject({
+    method: 'GET',
+    url: '/api/v1/receipts',
+    headers,
+  });
+  assert.equal(receiptResponse.statusCode, 200, receiptResponse.body);
+  assert.ok(receiptResponse.json().data.some(
+    (receipt: Record<string, unknown>) => String(receipt.receiptNumber).startsWith('DEMO13-RCT-')
+      && receipt.status === 'VOID',
+  ));
+
+  const collectionResponse = await app.inject({
+    method: 'GET',
+    url: '/api/v1/collection-batches',
+    headers,
+  });
+  assert.equal(collectionResponse.statusCode, 200, collectionResponse.body);
+  const demoCollectors = new Set(
+    collectionResponse.json().data
+      .filter((batch: Record<string, unknown>) => String(batch.batchNumber).startsWith('DEMO13-BATCH-'))
+      .map((batch: Record<string, unknown>) => batch.collectorName),
+  );
+  assert.equal(demoCollectors.size, 2);
+
+  const suspensionResponse = await app.inject({
+    method: 'GET',
+    url: '/api/v1/suspensions',
+    headers,
+  });
+  assert.equal(suspensionResponse.statusCode, 200, suspensionResponse.body);
+  assert.ok(suspensionResponse.json().data.filter(
+    (record: Record<string, unknown>) => String(record.serviceAccountNumber).startsWith('DEMO13-SVC-'),
+  ).length >= 3);
+
+  const reconnectionResponse = await app.inject({
+    method: 'GET',
+    url: '/api/v1/reconnections',
+    headers,
+  });
+  assert.equal(reconnectionResponse.statusCode, 200, reconnectionResponse.body);
+  assert.ok(reconnectionResponse.json().data.filter(
+    (record: Record<string, unknown>) => String(record.serviceAccountNumber).startsWith('DEMO13-SVC-'),
+  ).length >= 2);
+});
+
+test('Electron renderer communicates through the isolated API bridge without database access', () => {
+  const frontendRoot = resolve(process.cwd(), '..', 'bcis-system');
+  const apiSource = readFileSync(resolve(frontendRoot, 'src', 'api.ts'), 'utf8');
+  const preloadSource = readFileSync(resolve(frontendRoot, 'electron', 'preload.ts'), 'utf8');
+  const mainSource = readFileSync(resolve(frontendRoot, 'electron', 'main.ts'), 'utf8');
+  const rendererSources = [
+    readFileSync(resolve(frontendRoot, 'src', 'App.tsx'), 'utf8'),
+    readFileSync(resolve(frontendRoot, 'src', 'Workspace.tsx'), 'utf8'),
+    apiSource,
+  ].join('\n');
+
+  assert.match(apiSource, /window\.bcisApi\.request\(path/);
+  assert.match(preloadSource, /exposeInMainWorld\('bcisApi'/);
+  assert.match(preloadSource, /fetch\(`http:\/\/localhost:3000\$\{path\}`/);
+  assert.match(mainSource, /contextIsolation:\s*true/);
+  assert.match(mainSource, /nodeIntegration:\s*false/);
+  assert.doesNotMatch(rendererSources, /from\s+['"](?:pg|drizzle-orm)(?:\/[^'"]*)?['"]/);
+  assert.doesNotMatch(rendererSources, /require\(['"](?:pg|drizzle-orm)/);
 });

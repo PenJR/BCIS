@@ -1,1 +1,27 @@
-"use strict";const o=require("electron");o.contextBridge.exposeInMainWorld("bcisApi",{request:async(s,r={})=>{try{const t=await fetch(`http://localhost:3000${s}`,{...r,headers:{"Content-Type":"application/json",...r.headers??{}}}),e=await t.json();return!t.ok&&typeof e=="object"&&e!==null&&"success"in e,e}catch(t){const e=t instanceof Error?t.message:"Unable to reach the BCIS API.";throw new Error(`BCIS API request failed: ${e}`)}},health:async()=>(await fetch("http://localhost:3000/api/health")).json()});
+"use strict";
+const electron = require("electron");
+electron.contextBridge.exposeInMainWorld("bcisApi", {
+  request: async (path, options = {}) => {
+    try {
+      const response = await fetch(`http://localhost:3000${path}`, {
+        ...options,
+        headers: {
+          "Content-Type": "application/json",
+          ...options.headers ?? {}
+        }
+      });
+      const body = await response.json();
+      if (!response.ok && typeof body === "object" && body !== null && "success" in body) {
+        return body;
+      }
+      return body;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unable to reach the BCIS API.";
+      throw new Error(`BCIS API request failed: ${message}`);
+    }
+  },
+  health: async () => {
+    const response = await fetch("http://localhost:3000/api/health");
+    return response.json();
+  }
+});
