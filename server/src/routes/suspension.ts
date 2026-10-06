@@ -4,6 +4,7 @@ import {
   desc,
   eq,
   inArray,
+  lt,
 } from 'drizzle-orm';
 import { z } from 'zod';
 import * as schema from '../../db/schema';
@@ -20,7 +21,6 @@ const {
   invoices,
   paymentAllocations,
   payments,
-  paymentAllocations,
 } = schema;
 
 const managerRoles = ['OWNER', 'ADMINISTRATOR', 'COLLECTION_SUPERVISOR'];
@@ -50,20 +50,11 @@ async function overdueBalanceCents(
     .where(and(
       eq(invoices.serviceAccountId, serviceAccountId),
       inArray(invoices.status, ['UNPAID', 'PARTIALLY_PAID', 'OVERDUE']),
-      inArray(invoices.id, transaction
-        .select({ id: invoices.id })
-        .from(invoices)
-        .where(and(
-          eq(invoices.serviceAccountId, serviceAccountId),
-          inArray(invoices.status, ['UNPAID', 'PARTIALLY_PAID', 'OVERDUE']),
-          // Date strings are compared lexicographically in ISO format.
-          // The query keeps the financial sum within PostgreSQL numeric values.
-          // This branch is filtered again below before balance aggregation.
-          eq(invoices.serviceAccountId, serviceAccountId),
-        ))),
-    ));
+      lt(invoices.dueDate, asOfDate),
+    ))
+    .for('update');
 
-  const pastDueInvoices = overdueInvoices.filter((invoice) => invoice.id);
+  const pastDueInvoices = overdueInvoices;
   const invoiceIds = pastDueInvoices.map((invoice) => invoice.id);
   if (invoiceIds.length === 0) return 0n;
 
@@ -90,7 +81,6 @@ async function overdueBalanceCents(
   }
 
   return pastDueInvoices.reduce((total, invoice) => {
-    if (invoice.dueDate >= asOfDate) return total;
     const [whole, fraction = ''] = invoice.totalAmount.split('.');
     const balance = BigInt(whole) * 100n
       + BigInt(fraction.padEnd(2, '0'))

@@ -1537,6 +1537,28 @@ test('receivables aging and suspension lifecycle use outstanding balances', asyn
     status: 'UNPAID',
   }).returning({ id: invoices.id });
   receivableInvoiceIds.push(invoice[0].id);
+  const currentCycle = await database.insert(billingCycles).values({
+    cycleCode: `P10-CURRENT-${suffix}`,
+    periodStart: today,
+    periodEnd: today,
+    dueDate: today,
+    status: 'CLOSED',
+  }).returning({ id: billingCycles.id });
+  receivableCycleIds.push(currentCycle[0].id);
+  const currentInvoice = await database.insert(invoices).values({
+    invoiceNumber: `P10-CURRENT-${suffix}`,
+    serviceAccountId: masterDataIds.serviceAccountId,
+    billingCycleId: currentCycle[0].id,
+    invoiceDate: today,
+    dueDate: new Date(Date.parse(`${today}T00:00:00Z`) + 30 * 86_400_000)
+      .toISOString().slice(0, 10),
+    subtotal: '5.00',
+    discountAmount: '0.00',
+    penaltyAmount: '0.00',
+    totalAmount: '5.00',
+    status: 'UNPAID',
+  }).returning({ id: invoices.id });
+  receivableInvoiceIds.push(currentInvoice[0].id);
 
   const payment = await app.inject({
     method: 'POST',
@@ -1577,6 +1599,12 @@ test('receivables aging and suspension lifecycle use outstanding balances', asyn
   assert.equal(moneyToCents(invoiceReceivable.balance), 3000n);
   assert.equal(invoiceReceivable.daysOverdue, 45);
   assert.equal(invoiceReceivable.agingBucket, '31_60_DAYS');
+  const currentInvoiceReceivable = accountReceivable.invoices.find(
+    (item: { invoiceId: number }) => item.invoiceId === currentInvoice[0].id,
+  );
+  assert.equal(currentInvoiceReceivable.balance, '5.00');
+  assert.equal(currentInvoiceReceivable.agingBucket, 'CURRENT');
+  assert.equal(moneyToCents(accountReceivable.aging.current) >= 500n, true);
   assert.equal(moneyToCents(accountReceivable.aging.days31To60) >= 3000n, true);
   assert.equal(moneyToCents(accountReceivable.overdueBalance) >= 3000n, true);
   assert.equal((await app.inject({ method: 'GET', url: '/api/v1/receivables' })).statusCode, 401);
