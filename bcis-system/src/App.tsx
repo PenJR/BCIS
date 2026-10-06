@@ -1,4 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
+import { BrowserRouter, Link, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { useForm } from 'react-hook-form';
+import { z } from 'zod';
+import { apiRequest } from './api';
+import { collectionWriteRoles, ledgerViewRoles } from './roles';
+import Workspace from './Workspace';
 import './App.css';
 
 type User = {
@@ -10,474 +17,252 @@ type User = {
   role: string;
 };
 
-type ApiResult<T> = {
-  success: boolean;
-  message?: string;
-  data?: T;
-  token?: string;
+type Auth = {
+  token: string;
+  user: User;
 };
 
-type PageKey =
-  | 'dashboard'
-  | 'subscribers'
-  | 'billing'
-  | 'payments'
-  | 'collections'
-  | 'reports'
-  | 'administration';
+const loginSchema = z.object({
+  username: z.string().trim().min(1, 'Enter your username.'),
+  password: z.string().min(1, 'Enter your password.'),
+});
 
-const API_BASE = 'http://localhost:3000';
+type LoginFields = z.infer<typeof loginSchema>;
 
-const subscribersData = [
-  { account: 'BCIS-1001', name: 'Maria Santos', area: 'Malaybalay', status: 'ACTIVE' },
-  { account: 'BCIS-1048', name: 'Ramon Dela Cruz', area: 'Valencia', status: 'OVERDUE' },
-  { account: 'BCIS-1109', name: 'Alicia Gomez', area: 'Kibawe', status: 'ACTIVE' },
-  { account: 'BCIS-1182', name: 'Benjie Flores', area: 'Manolo Fortich', status: 'SUSPENDED' },
+const navigation = [
+  { path: '/', label: 'Dashboard' },
+  { path: '/subscribers', label: 'Subscribers' },
+  { path: '/service-accounts', label: 'Service accounts' },
+  { path: '/billing', label: 'Billing & invoices' },
+  { path: '/payments', label: 'Payments' },
+  { path: '/collections', label: 'Collections', roles: collectionWriteRoles },
+  { path: '/receivables', label: 'Receivables' },
+  { path: '/receipts', label: 'Receipts' },
+  { path: '/reports', label: 'Reports', roles: ledgerViewRoles },
 ];
 
-const billingRows = [
-  { invoice: 'INV-2458', subscriber: 'Maria Santos', amount: '₱1,250.00', status: 'UNPAID' },
-  { invoice: 'INV-2461', subscriber: 'Ramon Dela Cruz', amount: '₱2,890.00', status: 'PARTIALLY PAID' },
-  { invoice: 'INV-2464', subscriber: 'Alicia Gomez', amount: '₱1,580.00', status: 'PAID' },
-  { invoice: 'INV-2470', subscriber: 'Benjie Flores', amount: '₱990.00', status: 'OVERDUE' },
-];
-
-const paymentRows = [
-  { receipt: 'RCPT-0891', subscriber: 'Maria Santos', method: 'GCash', amount: '₱1,250.00', status: 'POSTED' },
-  { receipt: 'RCPT-0893', subscriber: 'Ramon Dela Cruz', method: 'Cash', amount: '₱800.00', status: 'POSTED' },
-  { receipt: 'RCPT-0895', subscriber: 'Alicia Gomez', method: 'Bank Transfer', amount: '₱1,580.00', status: 'PENDING' },
-  { receipt: 'RCPT-0900', subscriber: 'Benjie Flores', method: 'Cash', amount: '₱500.00', status: 'REVERSED' },
-];
-
-const collectionRows = [
-  { batch: 'BATCH-101', collector: 'J. Salazar', area: 'Malaybalay', status: 'SUBMITTED', cash: '₱48,250.00' },
-  { batch: 'BATCH-102', collector: 'R. Magbanua', area: 'Valencia', status: 'IN_PROGRESS', cash: '₱36,900.00' },
-  { batch: 'BATCH-103', collector: 'M. Lim', area: 'Kibawe', status: 'REMITTED', cash: '₱41,120.00' },
-];
-
-const reportRows = [
-  { name: 'Daily Collection', owner: 'Accounting' },
-  { name: 'Aging Report', owner: 'Collections' },
-  { name: 'Subscriber Ledger', owner: 'Accounting' },
-  { name: 'Audit Activity', owner: 'Administration' },
-];
-
-async function apiRequest<T>(path: string, options: RequestInit = {}, token?: string): Promise<ApiResult<T>> {
-  const response = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(options.headers ?? {}),
-    },
-  });
-
-  return (await response.json()) as ApiResult<T>;
+function canOpen(path: string, role: string): boolean {
+  const item = navigation.find((entry) => entry.path === path);
+  if (!item) return false;
+  return !('roles' in item) || !item.roles || item.roles.includes(role);
 }
 
-function App() {
-  const [username, setUsername] = useState('admin');
-  const [password, setPassword] = useState('Admin123!');
-  const [token, setToken] = useState<string | null>(null);
-  const [user, setUser] = useState<User | null>(null);
-  const [health, setHealth] = useState('Checking API...');
-  const [users, setUsers] = useState<User[]>([]);
-  const [serviceTypes, setServiceTypes] = useState<Array<{ id: number; name: string; description?: string | null }>>([]);
+function Login({ onAuthenticated }: { onAuthenticated: (auth: Auth) => void }) {
   const [error, setError] = useState('');
-  const [activePage, setActivePage] = useState<PageKey>('dashboard');
+  const [working, setWorking] = useState(false);
+  const {
+    register,
+    handleSubmit,
+    formState: { errors },
+  } = useForm<LoginFields>({
+    resolver: zodResolver(loginSchema),
+    defaultValues: { username: '', password: '' },
+  });
 
-  useEffect(() => {
-    void (async () => {
-      try {
-        const result = await apiRequest<{ success: boolean; message: string }>('/api/health');
-        setHealth(result.success ? 'Backend online' : 'Backend unavailable');
-      } catch {
-        setHealth('Backend unavailable');
-      }
-    })();
-  }, []);
-
-  useEffect(() => {
-    if (!token) {
-      return;
-    }
-
-    void (async () => {
-      const me = await apiRequest<{ id: number; username: string; fullName: string; email?: string | null; status: string; role: string }>('/api/v1/auth/me', {}, token);
-
-      if (me.success && me.data) {
-        setUser({
-          id: me.data.id,
-          username: me.data.username,
-          fullName: me.data.fullName,
-          email: me.data.email,
-          status: me.data.status,
-          role: me.data.role,
-        });
-      }
-
-      const userList = await apiRequest<User[]>('/api/v1/users', {}, token);
-      if (userList.success && userList.data) {
-        setUsers(userList.data);
-      }
-
-      const types = await apiRequest<Array<{ id: number; name: string; description?: string | null }>>('/api/v1/service-types', {}, token);
-      if (types.success && types.data) {
-        setServiceTypes(types.data);
-      }
-    })();
-  }, [token]);
-
-  const handleLogin = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
+  const submit = handleSubmit(async (values) => {
     setError('');
-
-    const result = await apiRequest<{ token: string; user: User }>('/api/v1/auth/login', {
-      method: 'POST',
-      body: JSON.stringify({ username, password }),
-    });
-
-    if (!result.success || !result.data?.token) {
-      setError(result.message ?? 'Login failed');
-      return;
+    setWorking(true);
+    try {
+      const response = await apiRequest<{ token: string; user: User }>(
+        '/api/v1/auth/login',
+        undefined,
+        { method: 'POST', body: JSON.stringify(values) },
+      );
+      if (!response.success || !response.data?.token || !response.data.user) {
+        throw new Error(response.message ?? 'Sign-in failed.');
+      }
+      onAuthenticated(response.data);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Unable to sign in.');
+    } finally {
+      setWorking(false);
     }
+  });
 
-    setToken(result.data.token);
-    setUser(result.data.user);
-  };
-
-  const handleLogout = async () => {
-    if (!token) {
-      return;
-    }
-
-    await apiRequest('/api/v1/auth/logout', {
-      method: 'POST',
-    }, token);
-    setToken(null);
-    setUser(null);
-    setUsers([]);
-    setServiceTypes([]);
-    setActivePage('dashboard');
-  };
-
-  const navItems = useMemo(
-    () => [
-      { key: 'dashboard' as const, label: 'Dashboard' },
-      { key: 'subscribers' as const, label: 'Subscribers' },
-      { key: 'billing' as const, label: 'Billing' },
-      { key: 'payments' as const, label: 'Payments' },
-      { key: 'collections' as const, label: 'Collections' },
-      { key: 'reports' as const, label: 'Reports' },
-      { key: 'administration' as const, label: 'Administration' },
-    ],
-    [],
-  );
-
-  if (!token || !user) {
-    return (
-      <div className="login-shell">
-        <div className="login-card">
-          <div className="brand-row">
-            <div className="brand-mark">BCIS</div>
-            <div>
-              <h1>Subscription Billing</h1>
-              <p>Collection and billing system</p>
-            </div>
-          </div>
-          <p className="api-status">{health}</p>
-          <form onSubmit={handleLogin} className="login-form">
-            <label>
-              Username
-              <input value={username} onChange={(event) => setUsername(event.target.value)} />
-            </label>
-            <label>
-              Password
-              <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
-            </label>
-            {error ? <p className="error-text">{error}</p> : null}
-            <button type="submit">Login</button>
-          </form>
-          <div className="demo-box">
-            <strong>Demo user:</strong> admin / Admin123!
+  return (
+    <main className="login-shell">
+      <section className="login-card">
+        <div className="brand-row">
+          <div className="brand-mark">B</div>
+          <div>
+            <p className="eyebrow">Broadband operations</p>
+            <h1>BCIS Office</h1>
+            <p className="muted">Billing, collections and subscriber services</p>
           </div>
         </div>
-      </div>
-    );
+        <form className="form-stack" onSubmit={submit}>
+          <label className="field">
+            Username
+            <input autoComplete="username" {...register('username')} />
+            {errors.username && <small className="field-error">{errors.username.message}</small>}
+          </label>
+          <label className="field">
+            Password
+            <input type="password" autoComplete="current-password" {...register('password')} />
+            {errors.password && <small className="field-error">{errors.password.message}</small>}
+          </label>
+          {error && <div className="notice error" role="alert">{error}</div>}
+          <button className="primary-button" disabled={working}>
+            {working ? 'Signing in…' : 'Sign in'}
+          </button>
+        </form>
+        <p className="login-footnote">Sign in using your BCIS staff account.</p>
+      </section>
+    </main>
+  );
+}
+
+function ProtectedRoute({
+  auth,
+  children,
+  allowedRoles,
+}: {
+  auth: Auth | null;
+  children: React.ReactNode;
+  allowedRoles?: string[];
+}) {
+  const location = useLocation();
+  if (!auth) return <Navigate to="/login" replace state={{ from: location.pathname }} />;
+  if (allowedRoles && !allowedRoles.includes(auth.user.role)) {
+    return <Navigate to="/" replace />;
   }
+  return <>{children}</>;
+}
 
-  const renderPage = () => {
-    switch (activePage) {
-      case 'subscribers':
-        return (
-          <div className="page-block">
-            <div className="section-heading">
-              <h3>Subscribers</h3>
-              <button className="secondary-action">New subscriber</button>
-            </div>
-            <div className="table-card">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Account</th>
-                    <th>Name</th>
-                    <th>Area</th>
-                    <th>Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {subscribersData.map((row) => (
-                    <tr key={row.account}>
-                      <td>{row.account}</td>
-                      <td>{row.name}</td>
-                      <td>{row.area}</td>
-                      <td><span className={`status-pill ${row.status.toLowerCase().replace(/\s+/g, '-')}`}>{row.status}</span></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        );
-      case 'billing':
-        return (
-          <div className="page-block">
-            <div className="section-heading">
-              <h3>Billing</h3>
-              <button className="secondary-action">Generate invoices</button>
-            </div>
-            <div className="table-card">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Invoice</th>
-                    <th>Subscriber</th>
-                    <th>Amount</th>
-                    <th>Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {billingRows.map((row) => (
-                    <tr key={row.invoice}>
-                      <td>{row.invoice}</td>
-                      <td>{row.subscriber}</td>
-                      <td>{row.amount}</td>
-                      <td><span className={`status-pill ${row.status.toLowerCase().replace(/\s+/g, '-')}`}>{row.status}</span></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        );
-      case 'payments':
-        return (
-          <div className="page-block">
-            <div className="section-heading">
-              <h3>Payments</h3>
-              <button className="secondary-action">Post payment</button>
-            </div>
-            <div className="table-card">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Receipt</th>
-                    <th>Subscriber</th>
-                    <th>Method</th>
-                    <th>Amount</th>
-                    <th>Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {paymentRows.map((row) => (
-                    <tr key={row.receipt}>
-                      <td>{row.receipt}</td>
-                      <td>{row.subscriber}</td>
-                      <td>{row.method}</td>
-                      <td>{row.amount}</td>
-                      <td><span className={`status-pill ${row.status.toLowerCase().replace(/\s+/g, '-')}`}>{row.status}</span></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        );
-      case 'collections':
-        return (
-          <div className="page-block">
-            <div className="section-heading">
-              <h3>Collections</h3>
-              <button className="secondary-action">Create batch</button>
-            </div>
-            <div className="table-card">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Batch</th>
-                    <th>Collector</th>
-                    <th>Area</th>
-                    <th>Status</th>
-                    <th>Cash</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {collectionRows.map((row) => (
-                    <tr key={row.batch}>
-                      <td>{row.batch}</td>
-                      <td>{row.collector}</td>
-                      <td>{row.area}</td>
-                      <td><span className={`status-pill ${row.status.toLowerCase().replace(/\s+/g, '-')}`}>{row.status}</span></td>
-                      <td>{row.cash}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        );
-      case 'reports':
-        return (
-          <div className="page-block">
-            <div className="section-heading">
-              <h3>Reports</h3>
-              <button className="secondary-action">Export report</button>
-            </div>
-            <div className="table-card">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Report</th>
-                    <th>Owner</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {reportRows.map((row) => (
-                    <tr key={row.name}>
-                      <td>{row.name}</td>
-                      <td>{row.owner}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        );
-      case 'administration':
-        return (
-          <div className="page-block">
-            <div className="section-heading">
-              <h3>Administration</h3>
-              <button className="secondary-action">Manage users</button>
-            </div>
-            <div className="panel-grid two-up">
-              <div className="panel">
-                <h3>User roster</h3>
-                <ul className="data-list compact">
-                  {users.slice(0, 4).map((entry) => (
-                    <li key={entry.id}><span>{entry.fullName}</span><strong>{entry.role}</strong></li>
-                  ))}
-                </ul>
-              </div>
-              <div className="panel">
-                <h3>Service types</h3>
-                <ul className="data-list compact">
-                  {serviceTypes.slice(0, 4).map((entry) => (
-                    <li key={entry.id}><span>{entry.name}</span><strong>{entry.description ?? 'Standard'}</strong></li>
-                  ))}
-                </ul>
-              </div>
-            </div>
-          </div>
-        );
-      case 'dashboard':
-      default:
-        return (
-          <div className="page-block">
-            <section className="stats-grid">
-              <article className="stat-card">
-                <span>Total subscribers</span>
-                <strong>50</strong>
-              </article>
-              <article className="stat-card">
-                <span>Active service accounts</span>
-                <strong>60</strong>
-              </article>
-              <article className="stat-card">
-                <span>Current receivables</span>
-                <strong>₱284,550</strong>
-              </article>
-              <article className="stat-card">
-                <span>Pending GCash</span>
-                <strong>8</strong>
-              </article>
-            </section>
+function AppShell({
+  auth,
+  onLogout,
+}: {
+  auth: Auth;
+  onLogout: () => Promise<void>;
+}) {
+  const location = useLocation();
+  const [health, setHealth] = useState('Checking service…');
+  const [logoutError, setLogoutError] = useState('');
 
-            <section className="panel-grid">
-              <div className="panel">
-                <h3>System overview</h3>
-                <ul className="data-list">
-                  <li><span>API</span><strong>{health}</strong></li>
-                  <li><span>Username</span><strong>{user.username}</strong></li>
-                  <li><span>Status</span><strong>{user.status}</strong></li>
-                </ul>
-              </div>
-
-              <div className="panel">
-                <h3>Collections snapshot</h3>
-                <ul className="data-list">
-                  <li><span>Today's collections</span><strong>₱18,250</strong></li>
-                  <li><span>Monthly collections</span><strong>₱486,950</strong></li>
-                  <li><span>Open collection batches</span><strong>4</strong></li>
-                </ul>
-              </div>
-
-              <div className="panel">
-                <h3>Service types</h3>
-                <ul className="data-list">
-                  {serviceTypes.slice(0, 4).map((entry) => (
-                    <li key={entry.id}><span>{entry.name}</span><strong>{entry.description ?? 'Standard'}</strong></li>
-                  ))}
-                </ul>
-              </div>
-            </section>
-          </div>
+  useEffect(() => {
+    let active = true;
+    void window.bcisApi.health()
+      .then((result) => {
+        if (active) setHealth(
+          typeof result === 'object' && result !== null && 'success' in result && result.success
+            ? 'API connected'
+            : 'API unavailable',
         );
+      })
+      .catch(() => {
+        if (active) setHealth('API unavailable');
+      });
+    return () => { active = false; };
+  }, []);
+
+  const links = useMemo(
+    () => navigation.filter((item) => canOpen(item.path, auth.user.role)),
+    [auth.user.role],
+  );
+
+  const logout = async () => {
+    setLogoutError('');
+    try {
+      await onLogout();
+    } catch (cause) {
+      setLogoutError(cause instanceof Error ? cause.message : 'Could not sign out.');
     }
   };
 
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="brand">BCIS</div>
-        <nav>
-          {navItems.map((item) => (
-            <button
-              key={item.key}
-              type="button"
-              className={`nav-button ${activePage === item.key ? 'active' : ''}`}
-              onClick={() => setActivePage(item.key)}
+        <Link className="brand" to="/">
+          <span className="brand-icon">B</span>
+          <span><strong>BCIS</strong><small>Office system</small></span>
+        </Link>
+        <div className="nav-caption">WORKSPACE</div>
+        <nav className="sidebar-nav" aria-label="Main navigation">
+          {links.map((item) => (
+            <Link
+              key={item.path}
+              className={`nav-link ${location.pathname === item.path ? 'active' : ''}`}
+              to={item.path}
             >
+              <span className="nav-dot" />
               {item.label}
-            </button>
+            </Link>
           ))}
         </nav>
-        <button className="logout-button" onClick={handleLogout}>Logout</button>
+        <div className="sidebar-footer">
+          <span className={`connection-dot ${health === 'API connected' ? 'online' : ''}`} />
+          <span>{health}</span>
+        </div>
       </aside>
-
-      <main className="content">
+      <main className="main-shell">
         <header className="topbar">
           <div>
-            <p className="eyebrow">Logged in as</p>
-            <h2>{user.fullName}</h2>
+            <p className="eyebrow">Operations console</p>
+            <h1>{navigation.find((item) => item.path === location.pathname)?.label ?? 'BCIS Office'}</h1>
           </div>
-          <div className="badge">{user.role}</div>
+          <div className="profile">
+            <div className="profile-copy">
+              <strong>{auth.user.fullName}</strong>
+              <span>{auth.user.role.replace(/_/g, ' ')}</span>
+            </div>
+            <button className="button button-quiet" type="button" onClick={() => void logout()}>
+              Sign out
+            </button>
+          </div>
         </header>
-
-        {renderPage()}
+        {logoutError && <div className="notice error">{logoutError}</div>}
+        <Routes>
+          <Route path="/" element={<ProtectedRoute auth={auth}><Workspace page="dashboard" auth={auth} /></ProtectedRoute>} />
+          <Route path="/subscribers" element={<ProtectedRoute auth={auth}><Workspace page="subscribers" auth={auth} /></ProtectedRoute>} />
+          <Route path="/service-accounts" element={<ProtectedRoute auth={auth}><Workspace page="service-accounts" auth={auth} /></ProtectedRoute>} />
+          <Route path="/billing" element={<ProtectedRoute auth={auth}><Workspace page="billing" auth={auth} /></ProtectedRoute>} />
+          <Route path="/payments" element={<ProtectedRoute auth={auth}><Workspace page="payments" auth={auth} /></ProtectedRoute>} />
+          <Route path="/collections" element={<ProtectedRoute auth={auth} allowedRoles={collectionWriteRoles}><Workspace page="collections" auth={auth} /></ProtectedRoute>} />
+          <Route path="/receivables" element={<ProtectedRoute auth={auth}><Workspace page="receivables" auth={auth} /></ProtectedRoute>} />
+          <Route path="/receipts" element={<ProtectedRoute auth={auth}><Workspace page="receipts" auth={auth} /></ProtectedRoute>} />
+          <Route path="/reports" element={<ProtectedRoute auth={auth} allowedRoles={ledgerViewRoles}><Workspace page="reports" auth={auth} /></ProtectedRoute>} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
       </main>
     </div>
   );
 }
 
-export default App;
+function AppContent() {
+  const [auth, setAuth] = useState<Auth | null>(null);
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  if (!auth) {
+    if (location.pathname !== '/login') {
+      return <Navigate to="/login" replace />;
+    }
+    return <Login onAuthenticated={(nextAuth) => {
+      setAuth(nextAuth);
+      navigate('/');
+    }} />;
+  }
+
+  if (location.pathname === '/login') return <Navigate to="/" replace />;
+
+  const logout = async () => {
+    const response = await apiRequest('/api/v1/auth/logout', auth.token, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    if (!response.success) throw new Error(response.message ?? 'Sign-out failed.');
+    setAuth(null);
+    navigate('/login');
+  };
+
+  return <AppShell auth={auth} onLogout={logout} />;
+}
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <AppContent />
+    </BrowserRouter>
+  );
+}
