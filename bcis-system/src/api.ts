@@ -4,16 +4,38 @@ export type ApiResponse<T> = {
   data?: T | null;
 };
 
+const API_BASE_URL = 'http://localhost:3000';
+
+async function requestApi(path: string, options: RequestInit = {}): Promise<unknown> {
+  if (window.bcisApi) {
+    return window.bcisApi.request(path, options);
+  }
+
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(options.headers ?? {}),
+    },
+  });
+  return response.json();
+}
+
+export async function apiHealth(): Promise<unknown> {
+  if (window.bcisApi) {
+    return window.bcisApi.health();
+  }
+
+  const response = await fetch(`${API_BASE_URL}/api/health`);
+  return response.json();
+}
+
 export async function apiRequest<T>(
   path: string,
   token?: string,
   options: RequestInit = {},
 ): Promise<ApiResponse<T>> {
-  if (!window.bcisApi) {
-    throw new Error('The BCIS Electron API bridge is unavailable.');
-  }
-
-  const response = await window.bcisApi.request(path, {
+  const response = await requestApi(path, {
     ...options,
     headers: {
       ...(options.headers ?? {}),

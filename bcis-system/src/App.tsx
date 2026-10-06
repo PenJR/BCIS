@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
-import { BrowserRouter, Link, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
+import { BrowserRouter, HashRouter, Link, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
-import { apiRequest } from './api';
+import { apiHealth, apiRequest } from './api';
 import { auditRoles, collectionWriteRoles, ledgerViewRoles } from './roles';
 import Workspace from './Workspace';
 import './App.css';
@@ -143,7 +143,7 @@ function AppShell({
 
   useEffect(() => {
     let active = true;
-    void window.bcisApi.health()
+    void apiHealth()
       .then((result) => {
         if (active) setHealth(
           typeof result === 'object' && result !== null && 'success' in result && result.success
@@ -262,9 +262,11 @@ function AppContent() {
 }
 
 export default function App() {
+  const Router = window.location.protocol === 'file:' ? HashRouter : BrowserRouter;
+
   return (
-    <BrowserRouter>
+    <Router>
       <AppContent />
-    </BrowserRouter>
+    </Router>
   );
 }

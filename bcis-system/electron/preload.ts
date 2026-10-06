@@ -28,7 +28,7 @@ contextBridge.exposeInMainWorld('bcisApi', {
 
 declare global {
   interface Window {
-    bcisApi: {
+    bcisApi?: {
       request: (path: string, options?: RequestInit) => Promise<unknown>;
       health: () => Promise<unknown>;
     };
