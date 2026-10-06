@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
 import { randomUUID, pbkdf2Sync } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import Fastify from 'fastify';
 import { after, before, test } from 'node:test';
 import { and, eq, inArray } from 'drizzle-orm';
 import {
   auditLogs,
+  backupHistory,
   billingCycles,
   collectionAreas,
   collectorAssignments,
@@ -37,6 +40,7 @@ import {
 } from '../db/schema';
 import { authRoutes } from '../src/routes/auth';
 import { auditRoutes } from '../src/routes/audit';
+import { createBackupRoutes } from '../src/routes/backups';
 import { billingCycleRoutes } from '../src/routes/billing-cycles';
 import { billingGenerationRoutes } from '../src/routes/billing-generation';
 import { collectionRoutes } from '../src/routes/collections';
@@ -103,6 +107,7 @@ const suspensionRecordIds: number[] = [];
 const reconnectionRecordIds: number[] = [];
 const phase12AuditIds: number[] = [];
 const phase12ReceiptIds: number[] = [];
+const backupMetadataIds: number[] = [];
 let app: Fastify.FastifyInstance | undefined;
 let databaseAvailable = false;
 let ownerRoleId = 0;
@@ -170,6 +175,7 @@ before(async () => {
   app = Fastify();
   await app.register(authRoutes);
   await app.register(auditRoutes);
+  await app.register(createBackupRoutes());
   await app.register(subscriberRoutes);
   await app.register(serviceAccountRoutes);
   await app.register(serviceEventRoutes);
@@ -225,6 +231,9 @@ after(async () => {
     }
     if (phase12AuditIds.length > 0) {
       await database.delete(auditLogs).where(inArray(auditLogs.id, phase12AuditIds));
+    }
+    if (backupMetadataIds.length > 0) {
+      await database.delete(backupHistory).where(inArray(backupHistory.id, backupMetadataIds));
     }
     if (suspensionRecordIds.length > 0) {
       await database.delete(suspensionRecords).where(inArray(suspensionRecords.id, suspensionRecordIds));
@@ -2155,4 +2164,167 @@ test('Electron renderer communicates through the isolated API bridge without dat
   assert.match(mainSource, /nodeIntegration:\s*false/);
   assert.doesNotMatch(rendererSources, /from\s+['"](?:pg|drizzle-orm)(?:\/[^'"]*)?['"]/);
   assert.doesNotMatch(rendererSources, /require\(['"](?:pg|drizzle-orm)/);
+});
+
+test('backup endpoints enforce roles, store verified metadata, and restore only to a safe target', async (context) => {
+  if (!databaseAvailable || !db) {
+    context.skip('PostgreSQL is unavailable for backup metadata integration tests.');
+    return;
+  }
+
+  const backupDirectory = await mkdtemp(resolve(tmpdir(), 'bcis-backup-test-'));
+  const runnerCalls: Array<{ executable: string; args: string[]; environment: NodeJS.ProcessEnv }> = [];
+  const runner = async (
+    executable: string,
+    args: string[],
+    environment: NodeJS.ProcessEnv,
+  ): Promise<void> => {
+    runnerCalls.push({ executable, args, environment });
+    if (executable === 'fake-pg-dump') {
+      const outputIndex = args.indexOf('--file');
+      assert.notEqual(outputIndex, -1);
+      await writeFile(args[outputIndex + 1], Buffer.from('verified test dump'));
+    }
+  };
+  const sourceDatabaseUrl = 'postgresql://bcis_user:source-secret@localhost:5432/bcis_db';
+  const restoreDatabaseUrl = 'postgresql://bcis_user:restore-secret@localhost:5432/bcis_restore';
+  const backupApp = Fastify();
+  const backupToken = `phase14-backup-${randomUUID()}`;
+  const ownerToken = `phase14-restore-owner-${randomUUID()}`;
+  const administratorToken = `phase14-restore-admin-${randomUUID()}`;
+  const cashierToken = `phase14-backup-cashier-${randomUUID()}`;
+  const tokens = [backupToken, ownerToken, administratorToken, cashierToken];
+  const testUserId = testUserIds[0];
+  for (const [token, role] of [
+    [backupToken, 'OWNER'],
+    [ownerToken, 'OWNER'],
+    [administratorToken, 'ADMINISTRATOR'],
+    [cashierToken, 'CASHIER'],
+  ]) {
+    authSessions.set(token, {
+      userId: testUserId,
+      username: usernames[0],
+      fullName: 'Synthetic Backup Operator',
+      role,
+      expiresAt: Date.now() + 60_000,
+    });
+  }
+
+  try {
+    await backupApp.register(createBackupRoutes({
+      backupDirectory,
+      pgDumpPath: 'fake-pg-dump',
+      pgRestorePath: 'fake-pg-restore',
+      runCommand: runner,
+      sourceDatabaseUrl,
+      restoreDatabaseUrl,
+      restoreEnabled: true,
+      production: false,
+    }));
+    await backupApp.ready();
+
+    assert.equal((await backupApp.inject({ method: 'GET', url: '/api/v1/backups' })).statusCode, 401);
+    assert.equal((await backupApp.inject({
+      method: 'POST',
+      url: '/api/v1/backups',
+      headers: { authorization: `Bearer ${cashierToken}` },
+    })).statusCode, 403);
+    const createdBackup = await backupApp.inject({
+      method: 'POST',
+      url: '/api/v1/backups',
+      headers: { authorization: `Bearer ${backupToken}` },
+    });
+    assert.equal(createdBackup.statusCode, 201, createdBackup.body);
+    const backup = createdBackup.json().data as { id: number; backupFile: string; verified: boolean };
+    backupMetadataIds.push(backup.id);
+    assert.equal(backup.verified, true);
+    assert.match(backup.backupFile, /^bcis-\d+-[0-9a-f-]{36}\.dump$/i);
+    assert.doesNotMatch(createdBackup.body, /source-secret|restore-secret|postgresql:\/\//);
+    assert.equal(runnerCalls[0].environment.PGPASSWORD, 'source-secret');
+    assert.ok(!runnerCalls[0].args.some((argument) => argument.includes('source-secret')));
+
+    const history = await backupApp.inject({
+      method: 'GET',
+      url: '/api/v1/backups',
+      headers: { authorization: `Bearer ${backupToken}` },
+    });
+    assert.equal(history.statusCode, 200, history.body);
+    assert.ok(history.json().data.some((record: Record<string, unknown>) => record.id === backup.id));
+
+    const adminRestore = await backupApp.inject({
+      method: 'POST',
+      url: `/api/v1/backups/${backup.id}/restore`,
+      headers: { authorization: `Bearer ${administratorToken}` },
+    });
+    assert.equal(adminRestore.statusCode, 403);
+    assert.equal(runnerCalls.filter((call) => call.args.includes('--clean')).length, 0);
+
+    const restore = await backupApp.inject({
+      method: 'POST',
+      url: `/api/v1/backups/${backup.id}/restore`,
+      headers: { authorization: `Bearer ${ownerToken}` },
+    });
+    assert.equal(restore.statusCode, 200, restore.body);
+    assert.doesNotMatch(restore.body, /restore-secret|postgresql:\/\//);
+    const restoreInvocation = runnerCalls.find((call) => call.args.includes('--clean'));
+    assert.ok(restoreInvocation);
+    assert.ok(restoreInvocation.args.includes('bcis_restore'));
+    assert.ok(restoreInvocation.args.includes('--exit-on-error'));
+    assert.equal(restoreInvocation.environment.PGPASSWORD, 'restore-secret');
+    assert.ok(!restoreInvocation.args.some((argument) => argument.includes('restore-secret')));
+
+    const liveTargetApp = Fastify();
+    await liveTargetApp.register(createBackupRoutes({
+      backupDirectory,
+      runCommand: runner,
+      sourceDatabaseUrl,
+      restoreDatabaseUrl: sourceDatabaseUrl,
+      restoreEnabled: true,
+      production: false,
+    }));
+    await liveTargetApp.ready();
+    const unsafeRestore = await liveTargetApp.inject({
+      method: 'POST',
+      url: `/api/v1/backups/${backup.id}/restore`,
+      headers: { authorization: `Bearer ${ownerToken}` },
+    });
+    assert.equal(unsafeRestore.statusCode, 409);
+    assert.match(unsafeRestore.json().message, /must not be the live application database/);
+    await liveTargetApp.close();
+
+    const backupPath = resolve(backupDirectory, backup.backupFile);
+    await rm(backupPath);
+    const missingFileRestore = await backupApp.inject({
+      method: 'POST',
+      url: `/api/v1/backups/${backup.id}/restore`,
+      headers: { authorization: `Bearer ${ownerToken}` },
+    });
+    assert.equal(missingFileRestore.statusCode, 404);
+    assert.match(missingFileRestore.json().message, /missing/);
+
+    const missingUtilityApp = Fastify();
+    await missingUtilityApp.register(createBackupRoutes({
+      backupDirectory,
+      pgDumpPath: resolve(backupDirectory, 'missing-pg_dump.exe'),
+      sourceDatabaseUrl,
+    }));
+    await missingUtilityApp.ready();
+    const unavailableUtility = await missingUtilityApp.inject({
+      method: 'POST',
+      url: '/api/v1/backups',
+      headers: { authorization: `Bearer ${backupToken}` },
+    });
+    assert.equal(unavailableUtility.statusCode, 503);
+    assert.match(unavailableUtility.json().message, /was not found/);
+    assert.equal(unavailableUtility.json().data.status, 'FAILED');
+    backupMetadataIds.push(unavailableUtility.json().data.id);
+    await missingUtilityApp.close();
+  } finally {
+    await backupApp.close();
+    for (const token of tokens) authSessions.delete(token);
+    if (backupMetadataIds.length > 0) {
+      await db.delete(backupHistory).where(inArray(backupHistory.id, backupMetadataIds.splice(0)));
+    }
+    await rm(backupDirectory, { recursive: true, force: true });
+  }
 });

@@ -4,6 +4,7 @@ import { config } from './lib/config';
 import { db, initializeDatabase } from './lib/db';
 import { authRoutes } from './routes/auth';
 import { auditRoutes } from './routes/audit';
+import { backupRoutes } from './routes/backups';
 import { billingCycleRoutes } from './routes/billing-cycles';
 import { billingGenerationRoutes } from './routes/billing-generation';
 import { collectionRoutes } from './routes/collections';
@@ -32,6 +33,7 @@ async function start(): Promise<void> {
 
   await app.register(authRoutes);
   await app.register(auditRoutes);
+  await app.register(backupRoutes);
   await app.register(subscriberRoutes);
   await app.register(serviceAccountRoutes);
   await app.register(serviceEventRoutes);
