@@ -34,7 +34,8 @@ type Page =
   | 'receivables'
   | 'receipts'
   | 'reports'
-  | 'audit-logs';
+  | 'audit-logs'
+  | 'backups';
 type FormSchema = z.ZodObject<z.ZodRawShape>;
 type FormInput<S extends FormSchema> = z.input<S>;
 type FormField<S extends FormSchema> = {
@@ -52,6 +53,8 @@ type FormProps<S extends FormSchema> = {
   onSubmit: (values: z.output<S>) => Promise<void>;
   onCancel?: () => void;
 };
+
+const TABLE_PAGE_SIZE = 10;
 
 const positiveId = z.string().regex(/^[1-9]\d*$/, 'Choose a valid record.');
 const optionalId = z.string().optional();
@@ -405,6 +408,11 @@ function DataTable({
   empty?: string;
   actions?: (row: Row) => React.ReactNode;
 }) {
+  const [pageIndex, setPageIndex] = useState(0);
+  const pageCount = Math.max(1, Math.ceil(rows.length / TABLE_PAGE_SIZE));
+  const currentPage = Math.min(pageIndex, pageCount - 1);
+  const pageRows = rows.slice(currentPage * TABLE_PAGE_SIZE, (currentPage + 1) * TABLE_PAGE_SIZE);
+  useEffect(() => { setPageIndex(0); }, [rows]);
   const columns = useMemo(
     () => fields.map((field) => ({
       accessorKey: field,
@@ -413,37 +421,48 @@ function DataTable({
     [fields, labels],
   );
   const table = useLegacyTable<Row>({
-    data: rows,
+    data: pageRows,
     columns,
     getCoreRowModel: getCoreRowModel(),
   });
 
   if (rows.length === 0) return <div className="empty-state">{empty}</div>;
+  const firstRecord = currentPage * TABLE_PAGE_SIZE + 1;
+  const lastRecord = Math.min((currentPage + 1) * TABLE_PAGE_SIZE, rows.length);
 
   return (
-    <div className="table-wrap">
-      <table>
-        <thead>
-          {table.getHeaderGroups().map((group) => (
-            <tr key={group.id}>
-              {group.headers.map((header) => (
-                <th key={header.id}>{rowString(header.column.columnDef.header)}</th>
-              ))}
-              {actions && <th>Actions</th>}
-            </tr>
-          ))}
-        </thead>
-        <tbody>
-          {table.getRowModel().rows.map((row) => (
-            <tr key={row.id}>
-              {row.getVisibleCells().map((cell) => (
-                <td key={cell.id}>{rowString(cell.getValue())}</td>
-              ))}
-              {actions && <td className="row-actions">{actions(row.original)}</td>}
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            {table.getHeaderGroups().map((group) => (
+              <tr key={group.id}>
+                {group.headers.map((header) => (
+                  <th key={header.id}>{rowString(header.column.columnDef.header)}</th>
+                ))}
+                {actions && <th>Actions</th>}
+              </tr>
+            ))}
+          </thead>
+          <tbody>
+            {table.getRowModel().rows.map((row) => (
+              <tr key={row.id}>
+                {row.getVisibleCells().map((cell) => (
+                  <td key={cell.id}>{rowString(cell.getValue())}</td>
+                ))}
+                {actions && <td className="row-actions">{actions(row.original)}</td>}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <nav className="pagination" aria-label="Table pagination">
+        <span>Showing {firstRecord}–{lastRecord} of {rows.length.toLocaleString()} records · Page {currentPage + 1} of {pageCount}</span>
+        <div>
+          <button className="button button-quiet" type="button" disabled={currentPage === 0} onClick={() => setPageIndex(currentPage - 1)}>Previous</button>
+          <button className="button button-quiet" type="button" disabled={currentPage >= pageCount - 1} onClick={() => setPageIndex(currentPage + 1)}>Next</button>
+        </div>
+      </nav>
     </div>
   );
 }
@@ -1682,6 +1701,117 @@ function Reports({ auth }: { auth: Auth }) {
   );
 }
 
+type BackupRecord = {
+  id: number;
+  backupFile: string;
+  backupDate: string;
+  createdBy: number | null;
+  status: string;
+  verified: boolean;
+  notes: string | null;
+};
+
+function Backups({ auth }: { auth: Auth }) {
+  const [history, setHistory] = useState<BackupRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [working, setWorking] = useState<string | null>(null);
+  const [historyError, setHistoryError] = useState('');
+  const [operationError, setOperationError] = useState('');
+  const [message, setMessage] = useState('');
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setHistoryError('');
+    try {
+      const response = await apiRequest<BackupRecord[]>('/api/v1/backups', auth.token);
+      if (!response.success) throw new Error(response.message ?? 'Backup history could not be loaded.');
+      setHistory(response.data ?? []);
+    } catch (cause) {
+      setHistoryError(cause instanceof Error ? cause.message : 'Backup history could not be loaded.');
+    } finally {
+      setLoading(false);
+    }
+  }, [auth.token]);
+
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  const createBackup = async () => {
+    setWorking('create');
+    setOperationError('');
+    setMessage('');
+    try {
+      const response = await apiRequest<BackupRecord>('/api/v1/backups', auth.token, { method: 'POST' });
+      if (!response.success) throw new Error(response.message ?? 'Backup could not be created.');
+      setMessage('Backup created and verified with pg_restore.');
+      await refresh();
+    } catch (cause) {
+      setOperationError(cause instanceof Error ? cause.message : 'Backup could not be created.');
+    } finally {
+      setWorking(null);
+    }
+  };
+
+  const restoreBackup = async (backup: BackupRecord) => {
+    const confirmed = window.confirm(
+      `Restore backup ${backup.backupFile} to the configured isolated database ending in "_restore"? The live application database will not be changed.`,
+    );
+    if (!confirmed) return;
+
+    setWorking(`restore-${backup.id}`);
+    setOperationError('');
+    setMessage('');
+    try {
+      const response = await apiRequest(`/api/v1/backups/${backup.id}/restore`, auth.token, { method: 'POST' });
+      if (!response.success) throw new Error(response.message ?? 'Backup could not be restored.');
+      setMessage('Backup restored to the configured isolated _restore database.');
+      await refresh();
+    } catch (cause) {
+      setOperationError(cause instanceof Error ? cause.message : 'Backup could not be restored.');
+    } finally {
+      setWorking(null);
+    }
+  };
+
+  return (
+    <div className="page-content">
+      <SectionTitle title="Backup & restore" detail="Create and verify a server-side PostgreSQL backup. Restores are restricted to the configured isolated _restore database." />
+      <Panel title="Database backup" description="Credentials remain on the API server. The backup is created with pg_dump and verified before it is recorded.">
+        <div className="backup-actions">
+          <p>Restore is available only when the server has explicitly enabled it outside production and configured a dedicated restore database.</p>
+          <button className="primary-button" type="button" disabled={working !== null} onClick={() => void createBackup()}>
+            {working === 'create' ? 'Creating backup…' : 'Create backup'}
+          </button>
+        </div>
+        {operationError && <div className="notice error" role="alert">{operationError}</div>}
+        {message && <div className="notice success" role="status">{message}</div>}
+      </Panel>
+      <Panel title="Backup history" description={`${history.length.toLocaleString()} backup records`}>
+        <LoadState loading={loading} error={historyError} refresh={() => void refresh()}>
+          <DataTable
+            rows={history}
+            fields={['backupDate', 'backupFile', 'status', 'verified', 'createdBy', 'notes']}
+            labels={{ backupDate: 'Created', backupFile: 'Backup file', createdBy: 'Created by' }}
+            actions={(row) => {
+              const backup = row as BackupRecord;
+              const restoring = working === `restore-${backup.id}`;
+              return (
+                <button
+                  className="text-button"
+                  type="button"
+                  disabled={working !== null || !backup.verified || backup.status !== 'SUCCESS'}
+                  onClick={() => void restoreBackup(backup)}
+                >
+                  {restoring ? 'Restoring…' : 'Restore'}
+                </button>
+              );
+            }}
+          />
+        </LoadState>
+      </Panel>
+    </div>
+  );
+}
+
 export default function Workspace({ page, auth }: { page: Page; auth: Auth }) {
   if (page === 'dashboard') return <Dashboard auth={auth} />;
   if (page === 'subscribers') return <Subscribers auth={auth} />;
@@ -1692,5 +1822,6 @@ export default function Workspace({ page, auth }: { page: Page; auth: Auth }) {
   if (page === 'receivables') return <Receivables auth={auth} />;
   if (page === 'receipts') return <Receipts auth={auth} />;
   if (page === 'audit-logs') return <AuditLogs auth={auth} />;
+  if (page === 'backups') return <Backups auth={auth} />;
   return <Reports auth={auth} />;
 }

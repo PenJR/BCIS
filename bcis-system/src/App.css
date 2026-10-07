@@ -412,6 +412,40 @@ button:disabled {
   border-radius: 8px;
 }
 
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 12px;
+  color: #708088;
+  font-size: 0.77rem;
+}
+
+.pagination > div {
+  display: flex;
+  gap: 8px;
+}
+
+.pagination .button {
+  min-height: 34px;
+  padding: 6px 11px;
+}
+
+.backup-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.backup-actions p {
+  max-width: 680px;
+  color: #708088;
+  font-size: 0.84rem;
+  line-height: 1.6;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -728,6 +762,12 @@ tbody tr:hover td {
 
   .login-card {
     padding: 25px;
+  }
+
+  .pagination,
+  .backup-actions {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
 

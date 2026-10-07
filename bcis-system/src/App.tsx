@@ -40,6 +40,7 @@ const navigation = [
   { path: '/receipts', label: 'Receipts' },
   { path: '/reports', label: 'Reports', roles: ledgerViewRoles },
   { path: '/audit-logs', label: 'Audit logs', roles: auditRoles },
+  { path: '/backups', label: 'Backup & restore', roles: ['OWNER'] },
 ];
 
 function canOpen(path: string, role: string): boolean {
@@ -224,6 +225,7 @@ function AppShell({
           <Route path="/receipts" element={<ProtectedRoute auth={auth}><Workspace page="receipts" auth={auth} /></ProtectedRoute>} />
           <Route path="/reports" element={<ProtectedRoute auth={auth} allowedRoles={ledgerViewRoles}><Workspace page="reports" auth={auth} /></ProtectedRoute>} />
           <Route path="/audit-logs" element={<ProtectedRoute auth={auth} allowedRoles={auditRoles}><Workspace page="audit-logs" auth={auth} /></ProtectedRoute>} />
+          <Route path="/backups" element={<ProtectedRoute auth={auth} allowedRoles={['OWNER']}><Workspace page="backups" auth={auth} /></ProtectedRoute>} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>

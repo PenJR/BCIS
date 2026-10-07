@@ -8,6 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/src/index.js",
     "seed:demo": "tsx src/seed-demo.ts",
+    "test:backup:real": "tsx scripts/backup-restore-real.ts",
     "generate": "drizzle-kit generate",
     "migrate": "drizzle-kit push",
     "test": "tsx --test test/auth.integration.test.ts"

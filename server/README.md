@@ -43,11 +43,11 @@ required by the deployment. The server passes database passwords to the
 PostgreSQL utilities via their private process environment, not command-line
 arguments or API responses.
 
-The current development environment does not have `pg_dump` or `pg_restore` on
-`PATH`. Backup/restore authorization, destination safeguards, command
-construction, file validation, and metadata behavior are integration-tested
-with a stubbed utility runner; a real database dump and restore still require
-installation of the PostgreSQL client tools and operational verification.
+Backup/restore authorization, destination safeguards, command construction,
+file validation, and metadata behavior are covered by integration tests with
+a stubbed utility runner. The real-utility workflow below supplements those
+tests by invoking the configured `pg_dump` and `pg_restore` binaries and
+`pg_amcheck`.
 
 Only `OWNER` and `ADMINISTRATOR` can create or list backups; only `OWNER` can
 restore. Restore is disabled unless `BCIS_ENABLE_RESTORE=true` is explicitly
@@ -79,3 +79,25 @@ Use a restore-only PostgreSQL role with privileges restricted to that isolated
 database. Validate the restored database and its financial totals before
 switching any application configuration. The application never automatically
 switches its live `DATABASE_URL` as part of restoring a backup.
+
+### Real backup/restore verification
+
+With PostgreSQL client tools (`pg_dump`, `pg_restore`, and `pg_amcheck`)
+available on `PATH` or configured for the server, run from `server`:
+
+```powershell
+npm run test:backup:real
+```
+
+The workflow requires the configured `DATABASE_URL` database to be available,
+an `admin` user with the `OWNER` role (created by `ensureDemoAdmin` when
+missing), and a PostgreSQL role with permission to create and drop databases.
+It creates uniquely named temporary
+`bcis_phase9_*` and `bcis_phase9_*_restore` databases, uses the real backup
+routes/utilities to snapshot a test row, restores it, changes and adds test
+data, restores again, and verifies the original row and the reverted changes.
+It then checks for unvalidated constraints and runs `pg_amcheck`. The temporary
+databases, dump file, and backup-history row are removed when the workflow
+finishes; its successful backup/restore audit events remain in the configured
+metadata database. Run only with a non-production `DATABASE_URL`; never point
+this test at a production or valuable PostgreSQL instance.
