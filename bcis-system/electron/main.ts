@@ -1,10 +1,30 @@
 import { app, BrowserWindow } from 'electron';
+import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const runtimeConfigPath = path.join(app.getPath('userData'), 'bcis-config.json');
+
+function readRuntimeConfig(): { apiBaseUrl?: string } {
+  if (!existsSync(runtimeConfigPath)) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(readFileSync(runtimeConfigPath, 'utf8')) as Partial<{ apiBaseUrl?: string }>;
+    if (typeof parsed.apiBaseUrl === 'string' && parsed.apiBaseUrl.trim()) {
+      return { apiBaseUrl: parsed.apiBaseUrl.trim().replace(/\/$/, '') };
+    }
+  } catch {
+    return {};
+  }
+
+  return {};
+}
 
 process.env.APP_ROOT = path.join(__dirname, '..');
+process.env.BCIS_API_BASE_URL ??= readRuntimeConfig().apiBaseUrl;
 
 export const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
 export const MAIN_DIST = path.join(process.env.APP_ROOT, 'dist-electron');

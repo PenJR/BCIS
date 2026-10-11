@@ -1,35 +1,50 @@
-import { app as n, BrowserWindow as t } from "electron";
-import { fileURLToPath as a } from "node:url";
+import { app as n, BrowserWindow as a } from "electron";
+import { existsSync as d, readFileSync as f } from "node:fs";
+import { fileURLToPath as m } from "node:url";
 import e from "node:path";
-const r = e.dirname(a(import.meta.url));
-process.env.APP_ROOT = e.join(r, "..");
-const i = process.env.VITE_DEV_SERVER_URL, R = e.join(process.env.APP_ROOT, "dist-electron"), s = e.join(process.env.APP_ROOT, "dist");
-process.env.VITE_PUBLIC = i ? e.join(process.env.APP_ROOT, "public") : s;
-let o = null;
-function l() {
-  o = new t({
+const l = e.dirname(m(import.meta.url)), r = e.join(n.getPath("userData"), "bcis-config.json");
+function u() {
+  if (!d(r))
+    return {};
+  try {
+    const o = JSON.parse(f(r, "utf8"));
+    if (typeof o.apiBaseUrl == "string" && o.apiBaseUrl.trim())
+      return { apiBaseUrl: o.apiBaseUrl.trim().replace(/\/$/, "") };
+  } catch {
+    return {};
+  }
+  return {};
+}
+process.env.APP_ROOT = e.join(l, "..");
+var s;
+(s = process.env).BCIS_API_BASE_URL ?? (s.BCIS_API_BASE_URL = u().apiBaseUrl);
+const t = process.env.VITE_DEV_SERVER_URL, E = e.join(process.env.APP_ROOT, "dist-electron"), c = e.join(process.env.APP_ROOT, "dist");
+process.env.VITE_PUBLIC = t ? e.join(process.env.APP_ROOT, "public") : c;
+let i = null;
+function p() {
+  i = new a({
     width: 1200,
     height: 800,
     minWidth: 900,
     minHeight: 650,
     autoHideMenuBar: !0,
     webPreferences: {
-      preload: e.join(r, "preload.cjs"),
+      preload: e.join(l, "preload.cjs"),
       contextIsolation: !0,
       nodeIntegration: !1,
       sandbox: !1
     }
-  }), i ? o.loadURL(i) : o.loadFile(e.join(s, "index.html"));
+  }), t ? i.loadURL(t) : i.loadFile(e.join(c, "index.html"));
 }
 n.on("window-all-closed", () => {
-  process.platform !== "darwin" && (n.quit(), o = null);
+  process.platform !== "darwin" && (n.quit(), i = null);
 });
 n.on("activate", () => {
-  t.getAllWindows().length === 0 && l();
+  a.getAllWindows().length === 0 && p();
 });
-n.whenReady().then(l);
+n.whenReady().then(p);
 export {
-  R as MAIN_DIST,
-  s as RENDERER_DIST,
-  i as VITE_DEV_SERVER_URL
+  E as MAIN_DIST,
+  c as RENDERER_DIST,
+  t as VITE_DEV_SERVER_URL
 };

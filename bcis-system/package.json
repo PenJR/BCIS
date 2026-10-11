@@ -1,7 +1,9 @@
 {
   "name": "bcis-system",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
+  "description": "BCIS Business Collections and Information System",
+  "author": "PenJR",
   "type": "module",
   "scripts": {
     "dev": "vite",

@@ -67,11 +67,11 @@ async function start(): Promise<void> {
 
     await app.listen({
       port: config.PORT,
-      host: '0.0.0.0',
+      host: config.HOST,
     });
 
     console.log(
-      `BCIS API running on http://localhost:${config.PORT}`,
+      `BCIS API running on http://${config.HOST === '0.0.0.0' ? '127.0.0.1' : config.HOST}:${config.PORT}`,
     );
   } catch (error) {
     app.log.error(error);

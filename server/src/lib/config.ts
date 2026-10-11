@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import { z } from 'zod';
 
 const envSchema = z.object({
+  HOST: z.string().default('0.0.0.0'),
   PORT: z.coerce.number().default(3000),
   DATABASE_URL: z.string().default('postgresql://postgres:123@localhost:5432/bcis_db'),
   JWT_SECRET: z.string().default('bcis-development-secret'),

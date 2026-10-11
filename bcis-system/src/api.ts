@@ -4,7 +4,16 @@ export type ApiResponse<T> = {
   data?: T | null;
 };
 
-const API_BASE_URL = 'http://localhost:3000';
+function getApiBaseUrl(): string {
+  const configured =
+    window.bcisRuntimeConfig?.apiBaseUrl ??
+    (typeof process !== 'undefined' && process.env?.BCIS_API_BASE_URL ? process.env.BCIS_API_BASE_URL : undefined) ??
+    (import.meta.env?.VITE_BCIS_API_BASE_URL ?? 'http://localhost:3000');
+
+  return String(configured).replace(/\/$/, '');
+}
+
+const API_BASE_URL = getApiBaseUrl();
 
 async function requestApi(path: string, options: RequestInit = {}): Promise<unknown> {
   if (window.bcisApi) {

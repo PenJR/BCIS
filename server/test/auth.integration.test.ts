@@ -2159,7 +2159,8 @@ test('Electron renderer communicates through the isolated API bridge without dat
 
   assert.match(apiSource, /window\.bcisApi\.request\(path/);
   assert.match(preloadSource, /exposeInMainWorld\('bcisApi'/);
-  assert.match(preloadSource, /fetch\(`http:\/\/localhost:3000\$\{path\}`/);
+  assert.match(preloadSource, /BCIS_API_BASE_URL/);
+  assert.match(preloadSource, /fetch\(\`\$\{apiBaseUrl\}\$\{path\}\`/);
   assert.match(mainSource, /contextIsolation:\s*true/);
   assert.match(mainSource, /nodeIntegration:\s*false/);
   assert.doesNotMatch(rendererSources, /from\s+['"](?:pg|drizzle-orm)(?:\/[^'"]*)?['"]/);
